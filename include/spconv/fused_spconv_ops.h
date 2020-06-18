@@ -1,11 +1,11 @@
 // Copyright 2019 Yan Yan
-// 
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
-// 
+//
 //     http://www.apache.org/licenses/LICENSE-2.0
-// 
+//
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -17,17 +17,18 @@
 
 #include <spconv/indice.h>
 #include <spconv/reordering.h>
+#include <tensorview/torch_utils.h>
 #include <torch/script.h>
-#include <torch_utils.h>
 #include <utility/timer.h>
 
 namespace spconv {
 // torch.jit's doc says only support int64, so we need to convert to int32.
 
-template <typename T>
-torch::Tensor fusedIndiceConvBatchNorm(torch::Tensor features, torch::Tensor filters, torch::Tensor bias,
-                       torch::Tensor indicePairs, torch::Tensor indiceNum,
-                       int64_t numActOut, int64_t _inverse, int64_t _subM) {
+torch::Tensor
+fusedIndiceConvBatchNorm(torch::Tensor features, torch::Tensor filters,
+                         torch::Tensor bias, torch::Tensor indicePairs,
+                         torch::Tensor indiceNum, int64_t numActOut,
+                         int64_t _inverse, int64_t _subM) {
   bool subM = _subM != 0;
   bool inverse = _inverse != 0;
   auto device = features.device().type();
@@ -36,13 +37,16 @@ torch::Tensor fusedIndiceConvBatchNorm(torch::Tensor features, torch::Tensor fil
   auto numInPlanes = features.size(1);
   auto numOutPlanes = filters.size(ndim + 1);
   auto indicePairNumCpu = indiceNum.to({torch::kCPU});
-  auto indicePairMaxSizeIter = std::max_element(
-      indicePairNumCpu.data_ptr<int>(), indicePairNumCpu.data_ptr<int>() + kernelVolume);
-  int indicePairMaxOffset = indicePairMaxSizeIter - indicePairNumCpu.data_ptr<int>();
+  auto indicePairMaxSizeIter =
+      std::max_element(indicePairNumCpu.data_ptr<int>(),
+                       indicePairNumCpu.data_ptr<int>() + kernelVolume);
+  int indicePairMaxOffset =
+      indicePairMaxSizeIter - indicePairNumCpu.data_ptr<int>();
   int indicePairMaxSize = *indicePairMaxSizeIter;
-  
+
   /*if (_subM){
-    std::vector<int> indicePairNumVec(indicePairNumCpu.data_ptr<int>(), indicePairNumCpu.data_ptr<int>() + kernelVolume);
+    std::vector<int> indicePairNumVec(indicePairNumCpu.data_ptr<int>(),
+  indicePairNumCpu.data_ptr<int>() + kernelVolume);
     indicePairNumVec.erase(indicePairNumVec.begin() + indicePairMaxOffset);
 
     auto indicePairVecMaxSizeIter = std::max_element(
@@ -55,8 +59,10 @@ torch::Tensor fusedIndiceConvBatchNorm(torch::Tensor features, torch::Tensor fil
   // auto indicePairOptions =
   //     torch::TensorOptions().dtype(torch::kInt64).device(indicePairs.device());
 
-  torch::Tensor output = torch::zeros({numActOut, numOutPlanes}, options).copy_(bias);
-  torch::Tensor inputBuffer = torch::zeros({indicePairMaxSize, numInPlanes}, options);
+  torch::Tensor output =
+      torch::zeros({numActOut, numOutPlanes}, options).copy_(bias);
+  torch::Tensor inputBuffer =
+      torch::zeros({indicePairMaxSize, numInPlanes}, options);
   torch::Tensor outputBuffer =
       torch::zeros({indicePairMaxSize, numOutPlanes}, options);
   filters = filters.view({-1, numInPlanes, numOutPlanes});
@@ -73,30 +79,17 @@ torch::Tensor fusedIndiceConvBatchNorm(torch::Tensor features, torch::Tensor fil
       continue;
     }
     // auto timer = spconv::CudaContextTimer<>();
-    auto outputBufferBlob =
-        torch::from_blob(outputBuffer.data_ptr<T>(), {nHot, numOutPlanes}, options);
+    auto outputBufferBlob = torch::from_blob(outputBuffer.data_ptr(),
+                                             {nHot, numOutPlanes}, options);
     auto inputBufferBlob =
-        torch::from_blob(inputBuffer.data_ptr<T>(), {nHot, numInPlanes}, options);
+        torch::from_blob(inputBuffer.data_ptr(), {nHot, numInPlanes}, options);
 
     if (device == torch::kCPU) {
-      functor::SparseGatherFunctor<tv::CPU, T, int> gatherFtor;
-      gatherFtor(tv::CPU(), tv::torch2tv<T>(inputBuffer),
-                 tv::torch2tv<const T>(features),
-                 tv::torch2tv<const int>(indicePairs).subview(i, inverse), nHot);
-    } 
-#ifdef SPCONV_CUDA
+      sparse_gather_cpu(inputBuffer, features, indicePairs[i][inverse], nHot);
+    }
+#ifdef TV_CUDA
     else if (device == torch::kCUDA) {
-      functor::SparseGatherFunctor<tv::GPU, T, int> gatherFtor;
-      gatherFtor(tv::TorchGPU(), tv::torch2tv<T>(inputBuffer),
-                 tv::torch2tv<const T>(features),
-                 tv::torch2tv<const int>(indicePairs).subview(i, inverse), nHot);
-      TV_CHECK_CUDA_ERR();
-      /* slower than SparseGatherFunctor, may due to int->long conversion
-      auto indicePairLong = indicePairs[i][inverse].to(torch::kInt64);
-      auto indicePairBlob = torch::from_blob(indicePairLong.data<long>(), {nHot},
-      indicePairOptions); 
-      torch::index_select_out(inputBufferBlob, features, 0,
-      indicePairBlob);*/
+      sparse_gather_cuda(inputBuffer, features, indicePairs[i][inverse], nHot);
     }
 #endif
     else {
@@ -108,20 +101,13 @@ torch::Tensor fusedIndiceConvBatchNorm(torch::Tensor features, torch::Tensor fil
     // totalGEMMTime += timer.report() / 1000.0;
 
     if (device == torch::kCPU) {
-      functor::SparseScatterAddFunctor<tv::CPU, T, int> scatterFtor;
-      scatterFtor(tv::CPU(), tv::torch2tv<T>(output),
-                  tv::torch2tv<const T>(outputBuffer),
-                  tv::torch2tv<const int>(indicePairs).subview(i, !inverse), nHot,
-                  true);
+      sparse_scatter_add_cpu(outputBuffer, output, indicePairs[i][!inverse],
+                             nHot);
     }
-#ifdef SPCONV_CUDA 
+#ifdef TV_CUDA
     else if (device == torch::kCUDA) {
-      functor::SparseScatterAddFunctor<tv::GPU, T, int> scatterFtor;
-      scatterFtor(tv::TorchGPU(), tv::torch2tv<T>(output),
-                  tv::torch2tv<const T>(outputBuffer),
-                  tv::torch2tv<const int>(indicePairs).subview(i, !inverse), nHot,
-                  true);
-      TV_CHECK_CUDA_ERR();
+      sparse_scatter_add_cuda(outputBuffer, output, indicePairs[i][!inverse],
+                              nHot);
     }
 #endif
     else {

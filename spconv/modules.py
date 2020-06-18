@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+import time
 from collections import OrderedDict
 
-import spconv
 import torch
 from torch import nn
-import time
+
+import spconv
 
 
 def is_spconv_module(module):
@@ -72,7 +74,7 @@ class SparseSequential(SparseModule):
                   ('conv2', SparseConv2d(20,64,5)),
                   ('relu2', nn.ReLU())
                 ]))
-        
+
         # Example of using Sequential with kwargs(python 3.6+)
         model = SparseSequential(
                   conv1=SparseConv2d(1,20,5),
@@ -81,7 +83,6 @@ class SparseSequential(SparseModule):
                   relu2=nn.ReLU()
                 )
     """
-
     def __init__(self, *args, **kwargs):
         super(SparseSequential, self).__init__()
         if len(args) == 1 and isinstance(args[0], OrderedDict):
@@ -125,9 +126,12 @@ class SparseSequential(SparseModule):
     def forward(self, input):
         for k, module in self._modules.items():
             if is_spconv_module(module):  # use SpConvTensor as input
-                assert isinstance(input, spconv.SparseConvTensor)
-                self._sparity_dict[k] = input.sparity
-                input = module(input)
+                if isinstance(input, list):
+                    input = module(input)
+                else:
+                    assert isinstance(input, spconv.SparseConvTensor)
+                    self._sparity_dict[k] = input.sparity
+                    input = module(input)
             else:
                 if isinstance(input, spconv.SparseConvTensor):
                     if input.indices.shape[0] != 0:
@@ -145,7 +149,8 @@ class SparseSequential(SparseModule):
         idx = 0
         while idx < len(mods):
             if is_sparse_conv(mods[idx]):
-                if idx < len(mods) - 1 and isinstance(mods[idx + 1], nn.BatchNorm1d):
+                if idx < len(mods) - 1 and isinstance(mods[idx + 1],
+                                                      nn.BatchNorm1d):
                     new_module = SparseConvolution(
                         ndim=mods[idx].ndim,
                         in_channels=mods[idx].in_channels,
