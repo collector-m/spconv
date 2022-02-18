@@ -1,173 +1,184 @@
-# SpConv: PyTorch Spatially Sparse Convolution Library
+<!--
+ Copyright 2021 Yan Yan
+ 
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+ 
+     http://www.apache.org/licenses/LICENSE-2.0
+ 
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+[pypi-ver-cpu]: https://img.shields.io/pypi/v/spconv
+[pypi-ver-114]: https://img.shields.io/pypi/v/spconv-cu114
+[pypi-ver-111]: https://img.shields.io/pypi/v/spconv-cu111
+[pypi-ver-113]: https://img.shields.io/pypi/v/spconv-cu113
+[pypi-ver-102]: https://img.shields.io/pypi/v/spconv-cu102
 
-[![Build Status](https://github.com/traveller59/spconv/workflows/build/badge.svg)](https://github.com/traveller59/spconv/actions?query=workflow%3Abuild)
+[pypi-url-111]: https://pypi.org/project/spconv-cu111/
+[pypi-download-111]: https://img.shields.io/pypi/dm/spconv-cu111
+[pypi-url-113]: https://pypi.org/project/spconv-cu113/
+[pypi-download-113]: https://img.shields.io/pypi/dm/spconv-cu113
+[pypi-url-102]: https://pypi.org/project/spconv-cu102/
+[pypi-download-102]: https://img.shields.io/pypi/dm/spconv-cu102
+[pypi-url-114]: https://pypi.org/project/spconv-cu114/
+[pypi-download-114]: https://img.shields.io/pypi/dm/spconv-cu114
+[pypi-url-cpu]: https://pypi.org/project/spconv/
+[pypi-download-cpu]: https://img.shields.io/pypi/dm/spconv
 
-This is a spatially sparse convolution library like [SparseConvNet](https://github.com/facebookresearch/SparseConvNet) but faster and easy to read. This library provide sparse convolution/transposed, submanifold convolution, inverse convolution and sparse maxpool.
+# SpConv: Spatially Sparse Convolution Library
+[![Build Status](https://github.com/traveller59/spconv/workflows/build/badge.svg)](https://github.com/traveller59/spconv/actions?query=workflow%3Abuild) 
 
 
-2020-5-2, we add ConcatTable, JoinTable, AddTable, and Identity function to build ResNet and Unet in this version of spconv.
+|                | PyPI   | Install  |Downloads  |
+| -------------- |:---------------------:| ---------------------:| ---------------------:| 
+| CPU (Linux Only) | [![PyPI Version][pypi-ver-cpu]][pypi-url-cpu] | ```pip install spconv``` | [![pypi monthly download][pypi-download-cpu]][pypi-url-cpu] | 
+| CUDA 10.2 | [![PyPI Version][pypi-ver-102]][pypi-url-102] | ```pip install spconv-cu102``` | [![pypi monthly download][pypi-download-102]][pypi-url-102] | 
+| CUDA 11.1 | [![PyPI Version][pypi-ver-111]][pypi-url-111] | ```pip install spconv-cu111```| [![pypi monthly download][pypi-download-111]][pypi-url-111]| 
+| CUDA 11.3 (Linux Only) | [![PyPI Version][pypi-ver-113]][pypi-url-113] | ```pip install spconv-cu113```| [![pypi monthly download][pypi-download-113]][pypi-url-113]| 
+| CUDA 11.4 | [![PyPI Version][pypi-ver-114]][pypi-url-114] | ```pip install spconv-cu114```| [![pypi monthly download][pypi-download-114]][pypi-url-114]|
 
+```spconv``` is a project that provide heavily-optimized sparse convolution implementation with tensor core support. check [benchmark](docs/BENCHMARK.md) to see how fast spconv 2.x runs.
 
-## Docker:
+[Spconv 1.x code](https://github.com/traveller59/spconv/tree/v1.2.1). We won't provide any support for spconv 1.x since it's deprecated. use spconv 2.x if possible. <!--remove this message in spconv 2.2-->
 
-```docker pull scrin/dev-spconv```, contains python 3.8, cuda 10.1, fish shell, newest pytorch and tensorflow.
+Check [spconv 2.x algorithm introduction](docs/spconv2_algo.pdf) to understand sparse convolution algorithm in spconv 2.x!
 
-## Install on Ubuntu 16.04/18.04
+**WARNING** spconv < 2.1.18 users need to upgrade your version to 2.1.18, it fix a bug in conv weight init which cause std of inited weight too large, and a bug in PointToVoxel.
 
-* if you are using pytorch 1.4+ and encounter "nvcc fatal: unknown -Wall", you need to go to torch package dir and remove flags contains "-Wall" in INTERFACE_COMPILE_OPTIONS in Caffe2Targets.cmake. This problem can't be fixed in this project (to avoid this, I need to remove all torch dependency in cuda sources and drop half support).
+## Breaking changes in Spconv 2.x
 
-0. Use ```git clone xxx.git --recursive``` to clone this repo.
+Spconv 1.x users **NEED READ [THIS](docs/SPCONV_2_BREAKING_CHANGEs.md)** before using spconv 2.x.
 
-1. Install boost headers to your system include path, you can use either ```sudo apt-get install libboost-all-dev``` or download compressed files from boost official website and copy headers to include path.
+## Spconv 2.1 vs Spconv 1.x
 
-2. Download cmake >= 3.13.2, then add cmake executables to PATH.
+* spconv now can be installed by **pip**. see install section in readme for more details. Users don't need to build manually anymore!
+* Microsoft Windows support (only windows 10 has been tested).
+* fp32 (not tf32) training/inference speed is increased (+50~80%)
+* fp16 training/inference speed is greatly increased when your layer support tensor core (channel size must be multiple of 8).
+* int8 op is ready, but we still need some time to figure out how to run int8 in pytorch.
+* [doesn't depend on pytorch binary](docs/FAQ.md#What-does-no-dependency-on-pytorch-mean), but you may need at least pytorch >= 1.5.0 to run spconv 2.x.
+* since spconv 2.x doesn't depend on pytorch binary (never in future), it's impossible to support torch.jit/libtorch inference.
 
-3. Ensure you have installed pytorch 1.0+ in your environment, run ```python setup.py bdist_wheel``` (don't use ```python setup.py install```).
+## Spconv 2.x Development and Roadmap
 
-4. Run ```cd ./dist```, use pip to install generated whl file.
+Spconv 2.2 development has started. See [this issue](https://github.com/traveller59/spconv/issues/380) for more details.
 
-## Install on Windows 10 with CUDA 10 and python 3.6 (python 3.7 may have problem, see [this](https://github.com/pytorch/pytorch/issues/17233))
-
-Since install newest driver and CUDA is very simple on windows, please use CUDA 10 on windows. 
-
-0. Install Visual Studio 2017. Use ```git clone xxx.git --recursive``` to clone this repo.
-
-1. Download compressed files from boost official website and copy headers (i.e. boost_1_69/boost) to spconv/include.
-
-2. Download and install cmake >= 3.13.2, select add cmake to User or System PATH.
-
-3. Ensure you have installed pytorch 1.0 in your environment, run ```python setup.py bdist_wheel``` (don't use ```python setup.py install```).
-
-4. Run ```cd ./dist```, use pip to install generated whl file.
-
-## Compare with SparseConvNet
-
-### Features
-
-* SparseConvNet's Sparse Convolution don't support padding and dilation, spconv support this.
-
-* spconv only contains sparse convolutions, the batchnorm and activations can directly use layers from torch.nn, SparseConvNet contains lots of their own implementation of layers such as batchnorm and activations.
-
-### Speed
-
-* spconv is faster than SparseConvNet due to gpu indice generation and gather-gemm-scatter algorithm. SparseConvNet use hand-written gemm which is slow.
+See [dev plan](docs/SPCONV_DEVELOP_PLAN.md). A complete guide of spconv development will be released soon.
 
 ## Usage
 
-### SparseConvTensor
+Firstly you need to use ```import spconv.pytorch as spconv``` in spconv 2.x.
 
-```Python
-features = # your features with shape [N, numPlanes]
-indices = # your indices/coordinates with shape [N, ndim + 1], batch index must be put in indices[:, 0]
-spatial_shape = # spatial shape of your sparse tensor, spatial_shape[i] is shape of indices[:, 1 + i].
-batch_size = # batch size of your sparse tensor.
-x = spconv.SparseConvTensor(features, indices, spatial_shape, batch_size)
-x_dense_NCHW = x.dense() # convert sparse tensor to dense NCHW tensor.
-print(x.sparity) # helper function to check sparity. 
-```
+Then see [this](docs/USAGE.md).
 
-### Sparse Convolution
+Don't forget to check [performance guide](docs/PERFORMANCE_GUIDE.md).
 
-```Python
-import spconv
-from torch import nn
-class ExampleNet(nn.Module):
-    def __init__(self, shape):
-        super().__init__()
-        self.net = spconv.SparseSequential(
-            spconv.SparseConv3d(32, 64, 3), # just like nn.Conv3d but don't support group and all([d > 1, s > 1])
-            nn.BatchNorm1d(64), # non-spatial layers can be used directly in SparseSequential.
-            nn.ReLU(),
-            spconv.SubMConv3d(64, 64, 3, indice_key="subm0"),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            # when use submanifold convolutions, their indices can be shared to save indices generation time.
-            spconv.SubMConv3d(64, 64, 3, indice_key="subm0"),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            spconv.SparseConvTranspose3d(64, 64, 3, 2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            spconv.ToDense(), # convert spconv tensor to dense and convert it to NCHW format.
-            nn.Conv3d(64, 64, 3),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-        )
-        self.shape = shape
+## Install
 
-    def forward(self, features, coors, batch_size):
-        coors = coors.int() # unlike torch, this library only accept int coordinates.
-        x = spconv.SparseConvTensor(features, coors, self.shape, batch_size)
-        return self.net(x)# .dense()
-```
+You need to install python >= 3.6 (>=3.7 for windows) first to use spconv 2.x.
 
-### Inverse Convolution
+You need to install CUDA toolkit first before using prebuilt binaries or build from source.
 
-Inverse sparse convolution means "inv" of sparse convolution. the output of inverse convolution contains same indices as input of sparse convolution.
+You need at least CUDA 10.2 to build and run spconv 2.x. We won't offer any support for CUDA < 10.2.
 
-Inverse convolution usually used in semantic segmentation.
+### Prebuilt
 
-```Python
-class ExampleNet(nn.Module):
-    def __init__(self, shape):
-        super().__init__()
-        self.net = spconv.SparseSequential(
-            spconv.SparseConv3d(32, 64, 3, 2, indice_key="cp0"),
-            spconv.SparseInverseConv3d(64, 32, 3, indice_key="cp0"), # need provide kernel size to create weight
-        )
-        self.shape = shape
+We offer python 3.6-3.10 and cuda 10.2/11.1/11.3/11.4 prebuilt binaries for linux (manylinux).
 
-    def forward(self, features, coors, batch_size):
-        coors = coors.int()
-        x = spconv.SparseConvTensor(features, coors, self.shape, batch_size)
-        return self.net(x)
-```
+We offer python 3.7-3.10 and cuda 10.2/11.1/11.4 prebuilt binaries for windows 10/11.
 
-### Utility functions
+We will provide prebuilts for CUDA versions supported by latest pytorch release. For example, pytorch 1.10 provide cuda 10.2 and 11.3 prebuilts, so we provide them too.
 
-* convert point cloud to voxel
+For Linux users, you need to install pip >= 20.3 first to install prebuilt.
 
-```Python
+CUDA 11.1 will be removed in spconv 2.2 because pytorch 1.10 don't provide prebuilts for it.
 
-voxel_generator = spconv.utils.VoxelGenerator(
-    voxel_size=[0.1, 0.1, 0.1], 
-    point_cloud_range=[-50, -50, -3, 50, 50, 1],
-    max_num_points=30,
-    max_voxels=40000
-)
+```pip install spconv``` for CPU only (**Linux Only**). you should only use this for debug usage, the performance isn't optimized due to manylinux limit (no omp support).
 
-points = # [N, 3+] tensor.
-voxels, coords, num_points_per_voxel = voxel_generator.generate(points)
-```
+```pip install spconv-cu102``` for CUDA 10.2
 
-## Implementation Details
+```pip install spconv-cu111``` for CUDA 11.1
 
-This implementation use gather-gemm-scatter framework to do sparse convolution.
+```pip install spconv-cu113``` for CUDA 11.3 (**Linux Only**)
 
-## Projects using spconv:
+```pip install spconv-cu114``` for CUDA 11.4
 
-* [second.pytorch](https://github.com/traveller59/second.pytorch): Point Cloud Object Detection in KITTI Dataset.
+**NOTE** It's safe to have different **minor** cuda version between system and conda (pytorch) in **CUDA >= 11.0** because of [CUDA Minor Version Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/#minor-version-compatibility). For example, you can use spconv-cu114 with anaconda version of pytorch cuda 11.1 in a OS with CUDA 11.2 installed.
 
-## Authors
+For CUDA 10, we don't know whether ```spconv-cu102``` works with CUDA 10.0 and 10.1. Users can have a try.
 
-* **Yan Yan** - *Initial work* - [traveller59](https://github.com/traveller59)
+**NOTE** In Linux, you can install spconv-cuxxx without install CUDA to system! only suitable NVIDIA driver is required. for CUDA 11, we need driver >= 450.82.
 
-* **Bo Li** - *gpu indice generation idea, owner of patent of the sparse conv gpu indice generation algorithm (don't include subm)* - [prclibo](https://github.com/prclibo)
+#### Prebuilt GPU Support Matrix
 
-## Third party libraries
+See [this page](https://arnon.dk/matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/) to check supported GPU names by arch.
 
-* [CUDPP](https://github.com/cudpp/cudpp): A cuda library. contains a cuda hash implementation.
+| CUDA version | GPU Arch List  |
+| -------------- |:---------------------:|
+| 10.2 | 50,52,60,61,70,75     | 
+| 11.x       | 52,60,61,70,75,80,86     | 
+| 12.x       | 60,61,70,75,80,86,90     | 
 
-* [robin-map](https://github.com/Tessil/robin-map): A fast c++ hash library. almost 2x faster than std::unordered_map in this project.
+### Build from source for development (JIT, recommend)
 
-* [pybind11](https://github.com/pybind/pybind11): A head-only python c++ binding library.
+The c++ code will be built automatically when you change c++ code in project.
 
-* [prettyprint](https://github.com/louisdx/cxx-prettyprint): A head-only library for container print.
+For NVIDIA Embedded Platforms, you need to specify cuda arch before build: ```export CUMM_CUDA_ARCH_LIST="7.2"``` for xavier, ```export CUMM_CUDA_ARCH_LIST="6.2"``` for TX2, ```export CUMM_CUDA_ARCH_LIST="8.7"``` for orin.
 
-## License
+You need to remove ```cumm``` in ```requires``` section in pyproject.toml after install editable ```cumm``` and before install spconv due to pyproject limit (can't find editable installed ```cumm```).
 
-This project is licensed under the Apache license 2.0 License - see the [LICENSE.md](LICENSE.md) file for details
+You need to ensure ```pip list | grep spconv``` and ```pip list | grep cumm``` show nothing before install editable spconv/cumm.
 
-The [CUDPP](https://github.com/cudpp/cudpp) hash code is licensed under BSD License.
+#### Linux
 
-The [robin-map](https://github.com/Tessil/robin-map) code is licensed under MIT license.
+0. uninstall spconv and cumm installed by pip
+1. install build-essential, install CUDA
+2. ```git clone https://github.com/FindDefinition/cumm```, ```cd ./cumm```, ```pip install -e .```
+3. ```git clone https://github.com/traveller59/spconv```, ```cd ./spconv```, ```pip install -e .```
+4. in python, ```import spconv``` and wait for build finish.
+
+#### Windows
+0. uninstall spconv and cumm installed by pip
+1. install visual studio 2019 or newer. make sure C++ development component is installed. install CUDA
+2. set [powershell script execution policy](https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies?view=powershell-7.1)
+3. start a new powershell, run ```tools/msvc_setup.ps1```
+4. ```git clone https://github.com/FindDefinition/cumm```, ```cd ./cumm```, ```pip install -e .```
+5. ```git clone https://github.com/traveller59/spconv```, ```cd ./spconv```, ```pip install -e .```
+6. in python, ```import spconv``` and wait for build finish.
+
+### Build wheel from source (not recommend, this is done in CI.)
+
+You need to rebuild ```cumm``` first if you are build along a CUDA version that not provided in prebuilts.
+
+#### Linux
+
+1. install build-essential, install CUDA
+2. run ```export SPCONV_DISABLE_JIT="1"```
+3. run ```pip install pccm cumm wheel```
+4. run ```python setup.py bdist_wheel```+```pip install dists/xxx.whl```
+
+#### Windows
+
+1. install visual studio 2019 or newer. make sure C++ development component is installed. install CUDA
+2. set [powershell script execution policy](https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies?view=powershell-7.1)
+3. start a new powershell, run ```tools/msvc_setup.ps1```
+4. run ```$Env:SPCONV_DISABLE_JIT = "1"```
+5. run ```pip install pccm cumm wheel```
+6. run ```python setup.py bdist_wheel```+```pip install dists/xxx.whl```
+
+## Know issues
+
+* Spconv 2.x F16 runs slow in A100. 
+
+## Note
+
+The work is done when the author is an employee at [Tusimple](https://www.tusimple.com/).
+
+## LICENSE
+
+Apache 2.0
