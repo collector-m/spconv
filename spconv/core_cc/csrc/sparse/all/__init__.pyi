@@ -1,9 +1,24 @@
 from typing import overload, Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 from pccm.stubs import EnumValue, EnumClassValue
 from cumm.tensorview import Tensor
+from cumm.tensorview import CUDAKernelTimer
 class ThrustCustomAllocatorV2:
     alloc_func: Callable[int, int]
 class SpconvOps:
+    @staticmethod
+    def cumm_version() -> str: 
+        """
+        get cumm version when build spconv.
+                
+        """
+        ...
+    @staticmethod
+    def pccm_version() -> str: 
+        """
+        get pccm version when build spconv.
+                
+        """
+        ...
     @staticmethod
     def generate_conv_inds_stage1(indices: Tensor, indice_pairs: Tensor, indice_pairs_uniq: Tensor, indice_num_per_loc: Tensor, batch_size: int, output_dims: List[int], input_dims: List[int], ksize: List[int], stride: List[int], padding: List[int], dilation: List[int], transposed: bool = False, stream_int: int = 0) -> None: 
         """
@@ -34,14 +49,17 @@ class SpconvOps:
         """
         ...
     @staticmethod
-    def generate_conv_inds_stage2(indices: Tensor, hashdata: Tensor, indice_pairs: Tensor, indice_pairs_uniq: Tensor, out_inds: Tensor, num_out_act: int, batch_size: int, output_dims: List[int], input_dims: List[int], ksize: List[int], stride: List[int], padding: List[int], dilation: List[int], transposed: bool = False, stream_int: int = 0) -> int: 
+    def generate_conv_inds_stage2(indices: Tensor, hashdata_k: Tensor, hashdata_v: Tensor, indice_pairs: Tensor, indice_pairs_uniq: Tensor, indice_pairs_uniq_before_sort: Tensor, out_inds: Tensor, indice_num_per_loc: Tensor, num_out_act: int, batch_size: int, output_dims: List[int], input_dims: List[int], ksize: List[int], stride: List[int], padding: List[int], dilation: List[int], transposed: bool = False, stream_int: int = 0, use_bound_algo: bool = False) -> int: 
         """
         Args:
             indices: 
-            hashdata: 
+            hashdata_k: 
+            hashdata_v: 
             indice_pairs: 
             indice_pairs_uniq: 
+            indice_pairs_uniq_before_sort: 
             out_inds: 
+            indice_num_per_loc: 
             num_out_act: 
             batch_size: 
             output_dims: 
@@ -52,6 +70,7 @@ class SpconvOps:
             dilation: 
             transposed: 
             stream_int: 
+            use_bound_algo: 
         """
         ...
     @staticmethod
@@ -74,14 +93,65 @@ class SpconvOps:
         """
         ...
     @staticmethod
-    def generate_conv_inds_mask_stage2(indices: Tensor, hashdata: Tensor, indice_pairs_fwd: Tensor, indice_pairs_bwd: Tensor, indice_pairs_uniq: Tensor, out_inds: Tensor, mask_fwd: Tensor, mask_bwd: Tensor, num_out_act: int, batch_size: int, output_dims: List[int], input_dims: List[int], ksize: List[int], stride: List[int], padding: List[int], dilation: List[int], transposed: bool = False, stream_int: int = 0) -> int: 
+    def generate_conv_inds_mask_stage1_direct_table(indices: Tensor, hashdata_k: Tensor, hashdata_v: Tensor, indice_pairs_bwd: Tensor, indice_pairs_uniq: Tensor, indice_num_per_loc: Tensor, batch_size: int, output_dims: List[int], input_dims: List[int], ksize: List[int], stride: List[int], padding: List[int], dilation: List[int], transposed: bool = False, stream_int: int = 0) -> None: 
         """
         Args:
             indices: 
-            hashdata: 
+            hashdata_k: 
+            hashdata_v: 
+            indice_pairs_bwd: 
+            indice_pairs_uniq: 
+            indice_num_per_loc: 
+            batch_size: 
+            output_dims: 
+            input_dims: 
+            ksize: 
+            stride: 
+            padding: 
+            dilation: 
+            transposed: 
+            stream_int: 
+        """
+        ...
+    @staticmethod
+    def unique_hash(hashdata_k: Tensor, hashdata_v: Tensor, uniq_cnt: Tensor, out_indices_offset: Tensor, num_out_bound: int, stream_int: int = 0) -> int: 
+        """
+        Args:
+            hashdata_k: 
+            hashdata_v: 
+            uniq_cnt: 
+            out_indices_offset: 
+            num_out_bound: 
+            stream_int: 
+        """
+        ...
+    @staticmethod
+    def assign_output_direct_hash(out_indices_offset: Tensor, out_indices: Tensor, batch_size: int, output_dims: List[int], input_dims: List[int], ksize: List[int], stride: List[int], padding: List[int], dilation: List[int], stream_int: int = 0) -> None: 
+        """
+        Args:
+            out_indices_offset: 
+            out_indices: 
+            batch_size: 
+            output_dims: 
+            input_dims: 
+            ksize: 
+            stride: 
+            padding: 
+            dilation: 
+            stream_int: 
+        """
+        ...
+    @staticmethod
+    def generate_conv_inds_mask_stage2(indices: Tensor, hashdata_k: Tensor, hashdata_v: Tensor, indice_pairs_fwd: Tensor, indice_pairs_bwd: Tensor, indice_pairs_uniq: Tensor, indice_pairs_uniq_before_sort: Tensor, out_inds: Tensor, mask_fwd: Tensor, mask_bwd: Tensor, num_out_act: int, batch_size: int, output_dims: List[int], input_dims: List[int], ksize: List[int], stride: List[int], padding: List[int], dilation: List[int], transposed: bool = False, stream_int: int = 0) -> int: 
+        """
+        Args:
+            indices: 
+            hashdata_k: 
+            hashdata_v: 
             indice_pairs_fwd: 
             indice_pairs_bwd: 
             indice_pairs_uniq: 
+            indice_pairs_uniq_before_sort: 
             out_inds: 
             mask_fwd: 
             mask_bwd: 
@@ -98,11 +168,38 @@ class SpconvOps:
         """
         ...
     @staticmethod
-    def generate_subm_conv_inds(indices: Tensor, hashdata: Tensor, indice_pairs: Tensor, out_inds: Tensor, indice_num_per_loc: Tensor, batch_size: int, input_dims: List[int], ksize: List[int], dilation: List[int], indice_pair_mask: Tensor =  Tensor(), backward: bool = False, stream_int: int =  0) -> int: 
+    def generate_conv_inds_stage2_mask_direct_table(indices: Tensor, hashdata_k: Tensor, hashdata_v: Tensor, indice_pairs_fwd: Tensor, indice_pairs_bwd: Tensor, indice_pairs_uniq: Tensor, indice_pairs_uniq_before_sort: Tensor, out_inds: Tensor, mask_fwd: Tensor, mask_bwd: Tensor, num_out_act: int, batch_size: int, output_dims: List[int], input_dims: List[int], ksize: List[int], stride: List[int], padding: List[int], dilation: List[int], transposed: bool = False, stream_int: int = 0) -> int: 
         """
         Args:
             indices: 
-            hashdata: 
+            hashdata_k: 
+            hashdata_v: 
+            indice_pairs_fwd: 
+            indice_pairs_bwd: 
+            indice_pairs_uniq: 
+            indice_pairs_uniq_before_sort: 
+            out_inds: 
+            mask_fwd: 
+            mask_bwd: 
+            num_out_act: 
+            batch_size: 
+            output_dims: 
+            input_dims: 
+            ksize: 
+            stride: 
+            padding: 
+            dilation: 
+            transposed: 
+            stream_int: 
+        """
+        ...
+    @staticmethod
+    def generate_subm_conv_inds(indices: Tensor, hashdata_k: Tensor, hashdata_v: Tensor, indice_pairs: Tensor, out_inds: Tensor, indice_num_per_loc: Tensor, batch_size: int, input_dims: List[int], ksize: List[int], dilation: List[int], indice_pair_mask: Tensor =  Tensor(), backward: bool = False, stream_int: int =  0) -> int: 
+        """
+        Args:
+            indices: 
+            hashdata_k: 
+            hashdata_v: 
             indice_pairs: 
             out_inds: 
             indice_num_per_loc: 
@@ -172,6 +269,31 @@ class SpconvOps:
         """
         ...
     @staticmethod
+    def indice_maxpool(out_features: Tensor, features: Tensor, indice_pairs: Tensor, indice_pair_num: Tensor, num_activate_out: int, stream: int = 0) -> None: 
+        """
+        Args:
+            out_features: 
+            features: 
+            indice_pairs: 
+            indice_pair_num: 
+            num_activate_out: 
+            stream: 
+        """
+        ...
+    @staticmethod
+    def indice_maxpool_backward(din: Tensor, features: Tensor, out_features: Tensor, out_bp: Tensor, indice_pairs: Tensor, indice_pair_num: Tensor, stream: int = 0) -> None: 
+        """
+        Args:
+            din: 
+            features: 
+            out_features: 
+            out_bp: 
+            indice_pairs: 
+            indice_pair_num: 
+            stream: 
+        """
+        ...
+    @staticmethod
     def maxpool_implicit_gemm_forward(out: Tensor, inp: Tensor, inds: Tensor, stream: int = 0) -> None: 
         """
         Args:
@@ -190,6 +312,28 @@ class SpconvOps:
             dout: 
             dinp: 
             inds: 
+            stream: 
+        """
+        ...
+    @staticmethod
+    def avgpool_implicit_gemm_forward(out: Tensor, inp: Tensor, inds: Tensor, count_out: Tensor, stream: int = 0) -> None: 
+        """
+        Args:
+            out: 
+            inp: 
+            inds: 
+            count_out: 
+            stream: 
+        """
+        ...
+    @staticmethod
+    def avgpool_implicit_gemm_backward(dout: Tensor, dinp: Tensor, inds: Tensor, count_out: Tensor, stream: int = 0) -> None: 
+        """
+        Args:
+            dout: 
+            dinp: 
+            inds: 
+            count_out: 
             stream: 
         """
         ...
@@ -234,15 +378,6 @@ class SpconvOps:
         """
         ...
     @staticmethod
-    def sort_1d_by_key(data: Tensor, indices: Tensor =  Tensor(), stream: int = 0) -> Tensor: 
-        """
-        Args:
-            data: 
-            indices: 
-            stream: 
-        """
-        ...
-    @staticmethod
     def sort_1d_by_key_allocator(data: Tensor, alloc_func, indices: Tensor =  Tensor(), stream: int = 0) -> Tensor: 
         """
         Args:
@@ -276,10 +411,47 @@ class SpconvOps:
         """
         ...
     @staticmethod
+    def sort_1d_by_key_split_allocator_v2(data: Tensor, allocator, mask: Tensor, indices: Tensor =  Tensor(), stream: int = 0, mask_output: bool = False) -> Tensor: 
+        """
+        Args:
+            data: 
+            allocator: 
+            mask: 
+            indices: 
+            stream: 
+            mask_output: 
+        """
+        ...
+    @staticmethod
     def count_bits(a: Tensor) -> Tensor: 
         """
         Args:
             a: 
+        """
+        ...
+    @staticmethod
+    def reverse_bits(a: Tensor) -> Tensor: 
+        """
+        Args:
+            a: 
+        """
+        ...
+    @staticmethod
+    def maximum_value_int(data: Tensor, value: int, stream_int: int) -> None: 
+        """
+        Args:
+            data: 
+            value: 
+            stream_int: 
+        """
+        ...
+    @staticmethod
+    def sort_1d_by_key(data: Tensor, indices: Tensor =  Tensor(), stream: int = 0) -> Tensor: 
+        """
+        Args:
+            data: 
+            indices: 
+            stream: 
         """
         ...
     @staticmethod
@@ -326,5 +498,90 @@ class SpconvOps:
             empty_mean: 
             clear_voxels: 
             stream_int: 
+        """
+        ...
+    @staticmethod
+    def get_int32_max() -> int: ...
+    @staticmethod
+    def get_handcrafted_max_act_out(num_act_in: int, ksize: List[int], stride: List[int], padding: List[int], dilation: List[int]) -> int: 
+        """
+        Args:
+            num_act_in: 
+            ksize: 
+            stride: 
+            padding: 
+            dilation: 
+        """
+        ...
+    @staticmethod
+    def get_indice_gen_workspace_size(kv: int, num_act_in: int, num_act_out_bound: int, max_act_out_in_theory: int, subm: bool, use_int64_hash_k: bool, direct_table: bool) -> int: 
+        """
+        Args:
+            kv: 
+            num_act_in: 
+            num_act_out_bound: 
+            max_act_out_in_theory: 
+            subm: 
+            use_int64_hash_k: 
+            direct_table: 
+        """
+        ...
+    @staticmethod
+    def get_indice_gen_tensors_from_workspace(workspace, kv: int, num_act_in: int, num_act_out_bound: int, max_act_out_in_theory: int, subm: bool, use_int64_hash_k: bool, direct_table: bool) -> Dict[str, Tensor]: 
+        """
+        Args:
+            workspace: 
+            kv: 
+            num_act_in: 
+            num_act_out_bound: 
+            max_act_out_in_theory: 
+            subm: 
+            use_int64_hash_k: 
+            direct_table: 
+        """
+        ...
+    @staticmethod
+    def get_indice_pairs_implicit_gemm(allocator, indices: Tensor, batch_size: int, input_dims: List[int], algo: int, ksize: List[int], stride: List[int], padding: List[int], dilation: List[int], out_padding: List[int], subm: bool, transposed: bool, is_train: bool, stream_int: int = 0, num_out_act_bound: int = -1, timer: CUDAKernelTimer =  CUDAKernelTimer(False), direct_table: bool = False, preallocated: Dict[str, Tensor] =  {}) -> Tuple[Tensor, int]: 
+        """
+        Args:
+            allocator: 
+            indices: 
+            batch_size: 
+            input_dims: 
+            algo: 
+            ksize: 
+            stride: 
+            padding: 
+            dilation: 
+            out_padding: 
+            subm: 
+            transposed: 
+            is_train: 
+            stream_int: 
+            num_out_act_bound: 
+            timer: 
+            direct_table: 
+            preallocated: 
+        """
+        ...
+    @staticmethod
+    def get_indice_pairs(allocator, indices: Tensor, batch_size: int, input_dims: List[int], algo: int, ksize: List[int], stride: List[int], padding: List[int], dilation: List[int], out_padding: List[int], subm: bool, transposed: bool, stream_int: int = 0, num_out_act_bound: int = -1, num_input_act_bound: int = -1) -> int: 
+        """
+        Args:
+            allocator: 
+            indices: 
+            batch_size: 
+            input_dims: 
+            algo: 
+            ksize: 
+            stride: 
+            padding: 
+            dilation: 
+            out_padding: 
+            subm: 
+            transposed: 
+            stream_int: 
+            num_out_act_bound: 
+            num_input_act_bound: 
         """
         ...

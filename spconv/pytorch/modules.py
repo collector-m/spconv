@@ -132,7 +132,7 @@ class SparseSequential(SparseModule):
                 if isinstance(input, list):
                     input = module(input)
                 else:
-                    assert isinstance(input, spconv.SparseConvTensor)
+                    # assert isinstance(input, spconv.SparseConvTensor)
                     # self._sparity_dict[k] = input.sparity
                     input = module(input)
             else:

@@ -16,6 +16,8 @@ import os
 from pathlib import Path
 from typing import List
 from pccm.utils import project_is_editable, project_is_installed
+from cumm.gemm.constants import NVRTCMode
+import enum 
 
 PACKAGE_NAME = "spconv"
 PACKAGE_ROOT = Path(__file__).parent.resolve()
@@ -23,10 +25,21 @@ PACKAGE_ROOT = Path(__file__).parent.resolve()
 EDITABLE_INSTALLED = project_is_installed(
     PACKAGE_NAME) and project_is_editable(PACKAGE_NAME)
 
-_filter_hwio_env = os.getenv("SPCONV_FILTER_HWIO", "0")
-FILTER_HWIO = _filter_hwio_env == "1"
+_filter_hwio_env = os.getenv("SPCONV_FILTER_HWIO", None)
+if _filter_hwio_env is not None:
+    raise NotImplementedError("SPCONV_FILTER_HWIO is deprecated. use SPCONV_SAVED_WEIGHT_LAYOUT instead.")
+
 DISABLE_JIT = os.getenv("SPCONV_DISABLE_JIT", "0") == "1"
+
 NDIM_DONT_CARE = 3
+FILTER_HWIO = False
+
+SAVED_WEIGHT_LAYOUT = os.getenv("SPCONV_SAVED_WEIGHT_LAYOUT", "")
+
+if SAVED_WEIGHT_LAYOUT != "":
+    assert SAVED_WEIGHT_LAYOUT in ["KRSC", "RSKC", "RSCK"], "please set SAVED_WEIGHT_LAYOUT to KRSC, RSKC or RSCK"
+
+ALL_WEIGHT_IS_KRSC = True
 
 SPCONV_DEBUG_SAVE_PATH = os.getenv("SPCONV_DEBUG_SAVE_PATH", "")
 
@@ -43,3 +56,60 @@ else:
 # for f16 backward weight, larger splitk, larger compute error.
 # so we use this env to control maximum splitk.
 SPCONV_BWD_SPLITK = list(map(int, os.getenv("SPCONV_BWD_SPLITK", "1,2,4,8,16,32,64").split(",")))
+
+SPCONV_NVRTC_MODE = NVRTCMode.ConstantMemory
+SPCONV_DEBUG_NVRTC_KERNELS = False
+
+SPCONV_DEBUG_CPP_ONLY = project_is_editable(PACKAGE_NAME)
+
+
+class AllocKeys:
+    PairBwd = "PairBwd"
+    IndiceNumPerLoc = "IndiceNumPerLoc"
+    PairMask = "PairMask"
+    MaskArgSort = "MaskArgSort"
+    OutIndices = "OutIndices"
+    PairFwd = "PairFwd"
+    # PairMaskFwd = "PairMaskFwd"
+    PairMaskBwd = "PairMaskBwd"
+    # MaskArgSortFwd = "MaskArgSortFwd"
+    MaskArgSortBwd = "MaskArgSortBwd"
+
+    MaskOutputFwd = "MaskOutputFwd"
+
+    OutFeatures = "OutFeatures"
+
+    Features = "Features"
+    Filters = "Filters"
+    OutBp = "OutBp"
+    DIn = "DIn"
+    DFilters = "DFilters"
+
+    InpBuffer = "InpBuffer"
+    OutBuffer = "OutBuffer"
+
+    IndicePairsUniq = "IndicePairsUniq"
+    IndicePairsUniqBackup = "IndicePairsUniqBackup"
+
+    HashKOrKV = "HashKOrKV"
+    HashV = "HashV"
+
+    ThrustTemp = "ThrustTemp"
+    TightUniqueCount = "TightUniqueCount"
+
+
+SPCONV_DEBUG_WEIGHT = False
+
+SPCONV_CPP_INDICE_PAIRS = True 
+
+SPCONV_USE_DIRECT_TABLE = True 
+
+# currently use cpp pair gen is slightly slower than python, I don't know why.
+SPCONV_CPP_INDICE_PAIRS_IGEMM = os.getenv("SPCONV_CPP_INDICE_PAIRS_IGEMM", "0") == "1" 
+
+SPCONV_CPP_GEMM = True
+
+SPCONV_FX_TRACE_MODE = os.getenv("SPCONV_FX_TRACE_MODE", "0") == "1"
+
+
+SPCONV_DIRECT_TABLE_HASH_SIZE_SCALE = 1.1

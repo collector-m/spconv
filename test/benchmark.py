@@ -24,19 +24,47 @@ from spconv.core import ConvAlgo
 import spconv.pytorch as spconv
 from spconv.utils import Point2VoxelCPU3d
 
-
-def waymo_data(batch_size=1):
+# torch.backends.cudnn.enabled = False
+def waymo_data(batch_size=1, num_features=-1):
     gen = Point2VoxelCPU3d([0.1, 0.1, 0.1], [-80, -80, -2, 80, 80, 6], 3,
                            150000, 1)
     # gen = VoxelGeneratorV2([0.1, 0.1, 0.1], [-80, -80, -2, 80, 80, 6], 1,
     #                        150000)
     data = np.load(Path(__file__).parent / "data" / "benchmark-pc.npz")
     pc = np.ascontiguousarray(data["pc"])
+    voxels_tv, indices_tv, _ = gen.point_to_voxel(tv.from_numpy(pc))
+    voxels = voxels_tv.numpy().reshape(-1, 3)
+
+    if num_features > 0:
+        voxels = np.zeros((voxels.shape[0], num_features), dtype=voxels.dtype)
+    coors = indices_tv.numpy()
+    N = coors.shape[0]
+    coors = np.concatenate([np.full([N, 1], 0, coors.dtype), coors], axis=1)
+    return voxels, coors, gen.grid_size
+
+def waymo_data_large(batch_size=1):
+    gen = Point2VoxelCPU3d([0.1, 0.1, 0.1], [-80, -80, -2, 80, 80, 6], 3,
+                           1200000, 1)
+    # gen = VoxelGeneratorV2([0.1, 0.1, 0.1], [-80, -80, -2, 80, 80, 6], 1,
+    #                        150000)
+    data = np.load(Path(__file__).parent / "data" / "benchmark-pc.npz")
+    pc = np.ascontiguousarray(data["pc"])
+    pc2 = pc.copy()
+    pc2[:, 1] += 1
+    pc3 = pc.copy()
+    pc3[:, 1] += 2
+    pc4 = pc.copy()
+    pc4[:, 1] += 3
+    pc5 = pc.copy()
+    pc5[:, 1] += 4
+
+    pc = np.concatenate([pc, pc2, pc3, pc4, pc5])
     print(pc.shape)
     voxels_tv, indices_tv, _ = gen.point_to_voxel(tv.from_numpy(pc))
     voxels = voxels_tv.numpy().reshape(-1, 3)
     coors = indices_tv.numpy()
     N = coors.shape[0]
+    print("num voxels", N)
     coors = np.concatenate([np.full([N, 1], 0, coors.dtype), coors], axis=1)
     return voxels, coors, gen.grid_size
 
@@ -49,6 +77,21 @@ class Net(nn.Module):
         self.net = spconv.SparseSequential(
             spconv.SubMConv3d(3, 64, 3, bias=False, indice_key="c0",
                               algo=algo),
+            # spconv.SubMConv3d(32,
+            #                   32,
+            #                   3,
+            #                   bias=False,
+            #                   indice_key="c0",
+            #                   algo=algo),
+            # # nn.BatchNorm1d(32),
+            # # nn.ReLU(),
+            # # spconv.SparseConv3d(64, 64, 2, 2, bias=False,
+            # #                   algo=algo),
+            # spconv.SubMConv3d(32, 64, 3, bias=False, indice_key="c0",
+            #                   algo=algo),
+
+            # spconv.SubMConv3d(64, 64, 3, bias=False, indice_key="c0",
+            #                   algo=algo),
             # spconv.SubMConv3d(32,
             #                   32,
             #                   3,
@@ -168,8 +211,8 @@ class Net(nn.Module):
             # nn.ReLU(),
 
             # spconv.SparseInverseConv3d(256, 128, 2, indice_key="m5", bias=False, algo=algo),
-            # # nn.BatchNorm1d(128),
-            # # nn.ReLU(),
+            # # # nn.BatchNorm1d(128),
+            # # # nn.ReLU(),
 
             # spconv.SparseInverseConv3d(128, 64, 2, indice_key="m4", bias=False, algo=algo),
         )
@@ -269,17 +312,20 @@ def sort_bench():
     for i in range(10):
         a_tv_1 = a_tv.clone()
         SpconvOps.sort_1d_by_key(a_tv_1[0], mask_argsort_tv[0])
-
+import json
 
 def main():
     import pickle
+
     np.random.seed(50051)
     torch.manual_seed(50051)
-    # voxels, coors, spatial_shape = waymo_data()
+    # voxels, coors, spatial_shape = waymo_data(num_features=128)
     # with open("/home/yy/test_spconv.pkl", "wb") as f:
     #     pickle.dump((voxels, coors, spatial_shape), f)
     with open(Path(__file__).parent / "data" / "test_spconv.pkl", "rb") as f:
         (voxels, coors, spatial_shape) = pickle.load(f)
+    # voxels, coors, spatial_shape = waymo_data_large()
+
     print(spatial_shape)
     print(voxels.shape)
     # voxels = voxels[:100]
@@ -290,6 +336,7 @@ def main():
     coors_th = torch.from_numpy(coors).to(device).int()
     voxels_th.requires_grad = True
     algo = spconv.ConvAlgo.MaskImplicitGemm
+    print("ALGO")
     # 3080 Laptop
     # MaskImpGemm: 11.2ms
     # MaskSplitImpGemm: 12.2ms
@@ -312,7 +359,8 @@ def main():
     # MaskImpGemm: 51.0ms
     # MaskSplitImpGemm: 41.1ms
     # algo = None
-    net = Net(spatial_shape, algo).to(device).eval().to(dtype).train()
+    net = Net(spatial_shape, algo).to(device).eval().to(dtype)# .train()
+    # net.load_state_dict(net.state_dict())
     spconv.assign_name_for_sparse_modules(net)
     print(coors_th.shape)
     out = net(voxels_th, coors_th, 1)
@@ -321,26 +369,32 @@ def main():
     dout = np.random.uniform(-0.2, 0.2, out.features.shape).astype(np.float32)
     dout_t = torch.from_numpy(dout).to(device).to(dtype)
 
-    print(out.spatial_shape, out.features.mean(), out.features.max(),
+    print(out.spatial_shape, out.features.sum(1).mean(), out.features.max(),
           out.features.min())
     times = []
+    show_metrics = False
     with torch.no_grad():
-        for i in range(20):
-            print("------------")
-            torch.cuda.synchronize()
-            t = time.time()
-            out_nograd = net(voxels_th, coors_th, 1, True)
-            timer = out_nograd._timer
-            res = timer.collect_by_name("forward", timer.get_all_pair_time())
-            res2 = timer.collect_by_name("forward0", timer.get_all_pair_time())
+        for i in range(100):
+            # print("------------")
+            with tv.measure_duration() as measure:
+                out_nograd = net(voxels_th, coors_th, 1, show_metrics)
+            times.append(measure.duration)
+            if show_metrics:
+                timer = out_nograd._timer
+                items = list(timer.get_all_pair_time().items())
+                items.sort(key=lambda x: x[0])
+                print("SUM TIME:",  sum([x[1] for x in items]))
+                print(json.dumps(dict(items), indent=2))
+                inds_sum = 0
+                for k, v in items:
+                    if "gen_pairs" in k:
+                        inds_sum += v 
+                print("SUM GEN INDS:",  inds_sum)
 
-            print(sum(res.values()) + sum(res2.values()))
-            # print(timer.get_all_pair_time())
-
-            # print(sum(timer.get_all_pair_time().values()))
-            torch.cuda.synchronize()
-            # sort_bench()
-            times.append(time.time() - t)
+    # state = net.state_dict()
+    # state.pop("net.2.max_num_voxels_during_training")
+    # net.load_state_dict(state)
+    # breakpoint()
     print("spconv time", np.mean(times[10:]))
     # times = []
 

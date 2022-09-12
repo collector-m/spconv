@@ -13,12 +13,11 @@
 # limitations under the License.
 
 import contextlib
-from cumm.conv.bases import ConvEnum
 from cumm.gemm.core.metaarray import MetaArray, seq
 from cumm import dtypes
 import pccm
 from cumm.gemm.layout import TensorGeneric, to_stride
-from cumm.common import TensorView, TensorViewHashKernel, TensorViewKernel, ThrustLib, GemmBasic
+from cumm.common import TensorView, GemmDTypes, TensorViewKernel, ThrustLib, GemmBasic
 from cumm.gemm import codeops
 from typing import List
 from cumm.conv.params import ConvProblem
@@ -181,6 +180,85 @@ class IndiceMaxPool(pccm.Class):
         """)
         return code
 
+    @pccm.cuda.cuda_global_function
+    def forward_avgpool_implicit_gemm_kernel(self):
+        code = pccm.FunctionCode()
+        code.targ("T")
+
+        code.arg("out_features", f"T*")
+        code.arg("in_features", f"const T*")
+        code.arg("indices", "const int*")
+        code.arg("count_out", "int*")
+        code.arg("num_features", "int")
+        code.arg("RS", "int")
+        code.arg("num_indices", "int")
+
+        code.raw(f"""
+        for (int i : tv::KernelLoopY<int>(num_indices)) {{
+            auto out_ptr = out_features + i * num_features;
+            auto indices_ptr = indices + i;
+            int in_idx = 0;
+            int count = 0;
+            for (int k = 0; k < RS; ++k){{
+                in_idx = indices_ptr[0];
+                count += int(in_idx != -1);
+                indices_ptr += num_indices;
+            }}
+            if (count_out != nullptr){{
+                count_out[i] = count;
+            }}
+            for (int j : tv::KernelLoopX<int>(num_features)) {{
+                indices_ptr = indices + i;
+                int in_idx;
+                T in, in_temp;
+                in = T(0);
+                for (int k = 0; k < RS; ++k){{
+                    in_idx = indices_ptr[0];
+                    bool valid = in_idx != -1;
+                    in_temp = valid ? in_features[in_idx * num_features + j] : T(0);
+                    in += in_temp;
+                    indices_ptr += num_indices;
+                }}
+                out_ptr[j] = count > 0 ? in / T(count) : T(0);
+            }}
+        }}
+        """)
+        return code
+
+    @pccm.cuda.cuda_global_function
+    def backward_avgpool_implicit_gemm_kernel(self):
+        code = pccm.FunctionCode()
+        code.targ("T")
+        code.arg("dout_features", f"const T*")
+        code.arg("din_features", f"T*")
+        code.arg("indices_bwd", "const int*")
+        code.arg("count_out", "const int*")
+        code.arg("num_features", "int")
+        code.arg("RS", "int")
+        code.arg("num_indices", "int")
+
+        code.raw(f"""
+
+        for (int i : tv::KernelLoopY<int>(num_indices)) {{
+            auto din_ptr = din_features + i * num_features;
+            for (int j : tv::KernelLoopX<int>(num_features)) {{
+                auto indices_ptr = indices_bwd + i;
+                int out_idx = 0;
+                T sum_val = T(0);
+                for (int k = 0; k < RS; ++k){{
+                    out_idx = indices_ptr[0];
+                    bool valid = out_idx != -1;
+                    T dout = valid ? dout_features[out_idx * num_features + j] : T(0);
+                    int count = valid ? count_out[out_idx] : T(0);
+                    sum_val += dout * T(count);
+                    indices_ptr += num_indices;
+                }}
+                din_ptr[j] = sum_val;
+            }}
+        }}
+        """)
+        return code
+
     @pccm.cuda.static_function
     def forward(self):
         code = pccm.FunctionCode()
@@ -202,14 +280,14 @@ class IndiceMaxPool(pccm.Class):
                 // if a value is found, other value won't be executed.
                 int NumFeatures = TV_DECLTYPE(V)::value;
                 int Num0 = MaxThreads / NumFeatures;
-                dim3 blocks(tv::div_up(out.dim(1), NumFeatures), tv::div_up(nhot, Num0));
+                dim3 blocks(tv::div_up(out.dim(1), int64_t(NumFeatures)), tv::div_up(nhot, int64_t(Num0)));
                 dim3 threads(NumFeatures, Num0);
                 launcher = tv::cuda::Launch(blocks, threads, cudastream);
             }});
             if (!found){{
                 int NumFeatures = 16;
                 int Num0 = MaxThreads / NumFeatures;
-                dim3 blocks(tv::div_up(out.dim(1), NumFeatures), tv::div_up(nhot, Num0));
+                dim3 blocks(tv::div_up(out.dim(1), int64_t(NumFeatures)), tv::div_up(nhot, int64_t(Num0)));
                 dim3 threads(NumFeatures, Num0);
                 launcher = tv::cuda::Launch(blocks, threads, cudastream);
             }}
@@ -244,14 +322,14 @@ class IndiceMaxPool(pccm.Class):
                 // if a value is found, other value won't be executed.
                 int NumFeatures = TV_DECLTYPE(V)::value;
                 int Num0 = MaxThreads / NumFeatures;
-                dim3 blocks(tv::div_up(out.dim(1), NumFeatures), tv::div_up(nhot, Num0));
+                dim3 blocks(tv::div_up(out.dim(1), int64_t(NumFeatures)), tv::div_up(nhot, int64_t(Num0)));
                 dim3 threads(NumFeatures, Num0);
                 launcher = tv::cuda::Launch(blocks, threads, cudastream);
             }});
             if (!found){{
                 int NumFeatures = 16;
                 int Num0 = MaxThreads / NumFeatures;
-                dim3 blocks(tv::div_up(out.dim(1), NumFeatures), tv::div_up(nhot, Num0));
+                dim3 blocks(tv::div_up(out.dim(1), int64_t(NumFeatures)), tv::div_up(nhot, int64_t(Num0)));
                 dim3 threads(NumFeatures, Num0);
                 launcher = tv::cuda::Launch(blocks, threads, cudastream);
             }}
@@ -287,14 +365,14 @@ class IndiceMaxPool(pccm.Class):
                 // if a value is found, other value won't be executed.
                 int NumFeatures = TV_DECLTYPE(V)::value;
                 int Num0 = MaxThreads / NumFeatures;
-                dim3 blocks(tv::div_up(out.dim(1), NumFeatures), tv::div_up(nhot, Num0));
+                dim3 blocks(tv::div_up(out.dim(1), int64_t(NumFeatures)), tv::div_up(nhot, int64_t(Num0)));
                 dim3 threads(NumFeatures, Num0);
                 launcher = tv::cuda::Launch(blocks, threads, cudastream);
             }});
             if (!found){{
                 int NumFeatures = 16;
                 int Num0 = MaxThreads / NumFeatures;
-                dim3 blocks(tv::div_up(out.dim(1), NumFeatures), tv::div_up(nhot, Num0));
+                dim3 blocks(tv::div_up(out.dim(1), int64_t(NumFeatures)), tv::div_up(nhot, int64_t(Num0)));
                 dim3 threads(NumFeatures, Num0);
                 launcher = tv::cuda::Launch(blocks, threads, cudastream);
             }}
@@ -331,14 +409,14 @@ class IndiceMaxPool(pccm.Class):
                 // if a value is found, other value won't be executed.
                 int NumFeatures = TV_DECLTYPE(V)::value;
                 int Num0 = MaxThreads / NumFeatures;
-                dim3 blocks(tv::div_up(out.dim(1), NumFeatures), tv::div_up(nhot, Num0));
+                dim3 blocks(tv::div_up(out.dim(1), int64_t(NumFeatures)), tv::div_up(nhot, int64_t(Num0)));
                 dim3 threads(NumFeatures, Num0);
                 launcher = tv::cuda::Launch(blocks, threads, cudastream);
             }});
             if (!found){{
                 int NumFeatures = 16;
                 int Num0 = MaxThreads / NumFeatures;
-                dim3 blocks(tv::div_up(out.dim(1), NumFeatures), tv::div_up(nhot, Num0));
+                dim3 blocks(tv::div_up(out.dim(1), int64_t(NumFeatures)), tv::div_up(nhot, int64_t(Num0)));
                 dim3 threads(NumFeatures, Num0);
                 launcher = tv::cuda::Launch(blocks, threads, cudastream);
             }}
@@ -349,11 +427,97 @@ class IndiceMaxPool(pccm.Class):
         """)
         return code
 
+    @pccm.cuda.static_function
+    def forward_avgpool_implicit_gemm(self):
+        code = pccm.FunctionCode()
+        code.arg("out", "tv::Tensor")
+        code.arg("in", "tv::Tensor")
+        code.arg("inds", "tv::Tensor")
+        code.arg("count_out", "tv::Tensor")
+
+        code.arg("stream", "std::uintptr_t", "0")
+
+        code.raw(f"""
+        auto nhot = out.dim(0);
+
+        tv::check_shape(inds, {{-1, nhot}});
+        tv::check_shape(in, {{-1, out.dim(1)}});
+
+        auto cudastream = reinterpret_cast<cudaStream_t>(stream);
+        tv::dispatch<float, double, tv::half_t, tv::bfloat16_t>(out.dtype(), [&](auto I){{
+            using T = TV_DECLTYPE(I);
+            constexpr int MaxThreads = 512;
+            tv::cuda::Launch launcher(1);
+            bool found = tv::dispatch_int_noexcept<512, 256, 128, 64, 32, 16>(out.dim(1), [](int my, int expect){{return my >= expect;}}, [&](auto V){{
+                // if out.dim(1) > value in list above, run this function.
+                // if a value is found, other value won't be executed.
+                int NumFeatures = TV_DECLTYPE(V)::value;
+                int Num0 = MaxThreads / NumFeatures;
+                dim3 blocks(tv::div_up(out.dim(1), int64_t(NumFeatures)), tv::div_up(nhot, int64_t(Num0)));
+                dim3 threads(NumFeatures, Num0);
+                launcher = tv::cuda::Launch(blocks, threads, cudastream);
+            }});
+            if (!found){{
+                int NumFeatures = 16;
+                int Num0 = MaxThreads / NumFeatures;
+                dim3 blocks(tv::div_up(out.dim(1), int64_t(NumFeatures)), tv::div_up(nhot, int64_t(Num0)));
+                dim3 threads(NumFeatures, Num0);
+                launcher = tv::cuda::Launch(blocks, threads, cudastream);
+            }}
+            launcher(forward_avgpool_implicit_gemm_kernel<T>, out.data_ptr<T>(), in.data_ptr<const T>(),
+                inds.data_ptr<const int>(), count_out.data_ptr<int>(), out.dim(1), inds.dim(0), inds.dim(1));
+        }});
+        """)
+        return code
+
+    @pccm.cuda.static_function
+    def backward_avgpool_implicit_gemm(self):
+        code = pccm.FunctionCode()
+        code.arg("dout", "tv::Tensor")
+        code.arg("din", "tv::Tensor")
+        code.arg("inds", "tv::Tensor")
+        code.arg("count_out", "tv::Tensor")
+        code.arg("stream", "std::uintptr_t", "0")
+
+        code.raw(f"""
+        auto nhot = din.dim(0);
+        TV_ASSERT_RT_ERR(!count_out.empty(), "count out must not empty")
+        tv::check_shape(inds, {{-1, nhot}});
+        tv::check_shape(din, {{-1, dout.dim(1)}});
+        int num_act_out = dout.dim(1);
+        auto cudastream = reinterpret_cast<cudaStream_t>(stream);
+        tv::dispatch<float, double, tv::half_t, tv::bfloat16_t>(dout.dtype(), [&](auto I){{
+            using T = TV_DECLTYPE(I);
+            constexpr int MaxThreads = 512;
+            tv::cuda::Launch launcher(1);
+            bool found = tv::dispatch_int_noexcept<512, 256, 128, 64, 32, 16>(dout.dim(1), [](int my, int expect){{return my >= expect;}}, [&](auto V){{
+                // if out.dim(1) > value in list above, run this function.
+                // if a value is found, other value won't be executed.
+                int NumFeatures = TV_DECLTYPE(V)::value;
+                int Num0 = MaxThreads / NumFeatures;
+                dim3 blocks(tv::div_up(dout.dim(1), int64_t(NumFeatures)), tv::div_up(nhot, int64_t(Num0)));
+                dim3 threads(NumFeatures, Num0);
+                launcher = tv::cuda::Launch(blocks, threads, cudastream);
+            }});
+            if (!found){{
+                int NumFeatures = 16;
+                int Num0 = MaxThreads / NumFeatures;
+                dim3 blocks(tv::div_up(dout.dim(1), int64_t(NumFeatures)), tv::div_up(nhot, int64_t(Num0)));
+                dim3 threads(NumFeatures, Num0);
+                launcher = tv::cuda::Launch(blocks, threads, cudastream);
+            }}
+            launcher(backward_avgpool_implicit_gemm_kernel<T>, 
+                dout.data_ptr<const T>(), din.data_ptr<T>(),
+                inds.data_ptr<const int>(), count_out.data_ptr<const int>(),
+                dout.dim(1), inds.dim(0), inds.dim(1));
+        }});
+        """)
+        return code
 
 class IndiceMaxPoolCPU(pccm.Class):
     def __init__(self):
         super().__init__()
-        self.add_dependency(TensorView)
+        self.add_dependency(TensorView, GemmDTypes)
         if CUMM_CPU_ONLY_BUILD:
             self.add_dependency(OMPLib)
         self.add_include("tensorview/parallel/all.h")
@@ -370,7 +534,7 @@ class IndiceMaxPoolCPU(pccm.Class):
         code.raw(f"""
         int nhot = out_inds.dim(0);
         int num_features = in.dim(1);
-        tv::dispatch<float, double>(out.dtype(), [&](auto I){{
+        tv::dispatch<float, double, tv::half_t, tv::bfloat16_t>(out.dtype(), [&](auto I){{
             using T = TV_DECLTYPE(I);
             auto out_features = out.data_ptr<T>();
             auto in_features = in.data_ptr<const T>();
@@ -410,7 +574,7 @@ class IndiceMaxPoolCPU(pccm.Class):
         code.raw(f"""
         int nhot = out_inds.dim(0);
         int num_features = in.dim(1);
-        tv::dispatch<float, double>(out.dtype(), [&](auto I){{
+        tv::dispatch<float, double, tv::half_t, tv::bfloat16_t>(out.dtype(), [&](auto I){{
             using T = TV_DECLTYPE(I);
             auto out_features = out.data_ptr<const T>();
             auto in_features = in.data_ptr<const T>();

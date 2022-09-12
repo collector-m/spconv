@@ -1,5 +1,5 @@
 <!--
- Copyright 2021 Yan Yan
+ Copyright 2022 Yan Yan
  
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -14,12 +14,4 @@
  limitations under the License.
 -->
 
-# How to develop spconv 2.x
-
-## First step
-
-spconv 2.x is written in a unique c++ framework ```pccm```. read [pccm guide]() to learn how to use ```pccm```.
-
-It's recommend to uninstall spconv and cumm installed by pip, then install spconv and cumm both in editable mode (```pip install -e .```)
-
-## Architecture
+TODO

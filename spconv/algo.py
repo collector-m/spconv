@@ -12,29 +12,54 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from enum import Enum
-from cumm import tensorview as tv
-from typing import Dict, List, Set, Tuple, Union
-from spconv.core_cc.cumm.gemm.main import GemmAlgoDesp, GemmMainUnitTest, GemmParams
-from spconv.core_cc.cumm.conv.main import ConvAlgoDesp, ConvMainUnitTest, ConvParams
-from cumm.conv.bases import ConvLayout, ConvLayoutType, ConvOpType
-from cumm.gemm.algospec.core import GemmAlgo, ShuffleStrideType, get_min_arch_of_algo_str, get_available_algo_str_from_arch
-from cumm.gemm.codeops import group_by, div_up
-from spconv.constants import NDIM_DONT_CARE, SPCONV_BWD_SPLITK
-from typing import Optional
-import time
-from threading import Lock
 import contextlib
+import time
+from enum import Enum
+from threading import Lock
+from typing import Dict, List, Optional, Set, Tuple, Union
+
 import numpy as np
-from spconv.core import ConvAlgo, AlgoHint
+from cumm import tensorview as tv
+from cumm.conv.bases import ConvLayout, ConvLayoutType, ConvOpType
+from cumm.conv.kernel import ConvKernel
+from cumm.gemm.kernel import GemmKernel
+
+from cumm.gemm.algospec.core import (GemmAlgo, ShuffleStrideType,
+                                     get_available_algo_str_from_arch,
+                                     get_min_arch_of_algo_str)
+from cumm.gemm.codeops import div_up, group_by
+from cumm.nvrtc import CummNVRTCModule, get_cudadevrt_path
+from cumm.tensorview.gemm import ConvAlgoDesp
+from cumm.tensorview.gemm import ConvOpType as ConvOpTypeCpp
+
+from cumm.tensorview.gemm import ConvParams, GemmAlgoDesp, GemmParams
+from cumm import dtypes
+
+from spconv.constants import (NDIM_DONT_CARE, SPCONV_BWD_SPLITK,
+                              SPCONV_NVRTC_MODE, SPCONV_DEBUG_NVRTC_KERNELS)
+from spconv.core import ALL_IMPGEMM_PARAMS, AlgoHint, ConvAlgo, ALL_NATIVE_PARAMS
+from spconv.core_cc.cumm.conv.main import ConvMainUnitTest
+from spconv.core_cc.cumm.gemm.main import GemmMainUnitTest
+from spconv.cppconstants import COMPILED_CUDA_ARCHS
+from cumm.tensorview.gemm import NVRTCParams
 from spconv.tools import CUDAKernelTimer
+from cumm.gemm.constants import NVRTCConstants, NVRTCMode
+
+from spconv import algocore
+
+from cumm.conv.main import gen_gemm_kernels as gen_conv_kernels
+from cumm.gemm.main import gen_gemm_kernels
+from spconv.core_cc.csrc.sparse.convops import GemmTuneResult, ConvTuneResult
+from spconv.core_cc.csrc.sparse.convops.gemmops import GemmTunerSimple as GemmTunerSimpleBase
+from spconv.core_cc.csrc.sparse.convops.convops import ConvTunerSimple as ConvTunerSimpleBase
 
 ALL_ALGO_DESPS = GemmMainUnitTest.get_all_algo_desp()
 ALL_CONV_ALGO_DESPS = ConvMainUnitTest.get_all_conv_algo_desp()
-_GEMM_STATIC_KEY = Tuple[bool, bool, bool, int, int, int, str, str]
+_GEMM_STATIC_KEY = Tuple[bool, bool, bool, int, int, int, int, str]
 
 
 class SimpleGemmAlgoMeta:
+
     def __init__(self, tile_ms: List[int], tile_ns: List[int],
                  tile_ks: List[int],
                  tile_shape_to_algos: Dict[int, List[int]]) -> None:
@@ -45,22 +70,154 @@ class SimpleGemmAlgoMeta:
 
 
 class BestAlgoByProfile:
-    def __init__(self, algo_desp: GemmAlgoDesp, splitk: int = 1) -> None:
+
+    def __init__(self,
+                 algo_desp: GemmAlgoDesp,
+                 arch: Tuple[int, int],
+                 splitk: int = 1) -> None:
         self.algo_desp = algo_desp
         self.splitk = splitk
+        self.arch = arch
 
 
 class BestConvAlgoByProfile:
-    def __init__(self, algo_desp: ConvAlgoDesp, splitk: int = 1) -> None:
+
+    def __init__(self,
+                 algo_desp: ConvAlgoDesp,
+                 arch: Tuple[int, int],
+                 splitk: int = 1) -> None:
         self.algo_desp = algo_desp
         self.splitk = splitk
+        self.arch = arch
 
+
+def _get_nvrtc_params(mod: CummNVRTCModule, ker: Union[GemmKernel, ConvKernel],
+                      kernel_name: str):
+    nvrtc_mode = SPCONV_NVRTC_MODE
+    nvrtc_params = tv.gemm.NVRTCParams()
+    nvrtc_params.cumodule = mod.get_cpp_object()
+    nvrtc_params.mode = nvrtc_mode.value
+    nvrtc_params.num_threads = ker.num_threads
+    nvrtc_params.smem_size = ker.smem_size
+    ns = ker.namespace
+
+    if nvrtc_mode == NVRTCMode.DynamicParallism:
+        nvrtc_params.kernel_name = mod.get_lowered_name(f"{ns}::nvrtc_kernel")
+
+    elif nvrtc_mode == NVRTCMode.KernelAndCPU:
+        nvrtc_params.kernel_name = mod.get_lowered_name(f"{ns}::{kernel_name}")
+        nvrtc_params.init_kernel_name = mod.get_lowered_name(
+            f"{ns}::nvrtc_kernel_cpu_out")
+        nvrtc_params.param_size = mod.const_values[
+            f"{ns}::{NVRTCConstants.SIZEOF_KEY}"]
+
+        nvrtc_params.param_storage = tv.empty([nvrtc_params.param_size],
+                                              tv.uint8, 0)
+        nvrtc_params.param_storage_cpu = tv.empty([nvrtc_params.param_size],
+                                                  tv.uint8,
+                                                  -1,
+                                                  pinned=True)
+
+    elif nvrtc_mode == NVRTCMode.Direct:
+        nvrtc_params.kernel_name = mod.get_lowered_name(f"{ns}::{kernel_name}")
+    elif nvrtc_mode == NVRTCMode.ConstantMemory:
+        nvrtc_params.kernel_name = mod.get_lowered_name(f"{ns}::{kernel_name}")
+        nvrtc_params.init_kernel_name = mod.get_lowered_name(
+            f"{ns}::nvrtc_kernel_cpu_out")
+        nvrtc_params.param_size = mod.const_values[
+            f"{ns}::{NVRTCConstants.SIZEOF_KEY}"]
+        nvrtc_params.constant_name = mod.get_lowered_name(
+            f"&{ns}::{NVRTCConstants.CONSTANT_PARAM_KEY}")
+        nvrtc_params.param_storage = tv.empty([nvrtc_params.param_size],
+                                              tv.uint8, 0)
+    else:
+        raise NotImplementedError
+    return nvrtc_params
+
+class GemmTunerSimple(GemmTunerSimpleBase):
+    def __init__(self, desps: List[GemmAlgoDesp]) -> None:
+        super().__init__(desps)
+        self._nvrtc_caches: Dict[Tuple[str, Tuple[int, int], int], NVRTCParams] = {}
+    
+    def _compile_nvrtc_module(self, desp: GemmAlgoDesp):
+        params = algocore.get_gemm_param_from_desp(desp)
+        kernel = gen_gemm_kernels(params, SPCONV_NVRTC_MODE)
+        kernel.namespace = "spconv"
+        custom_names = []
+        if SPCONV_NVRTC_MODE == NVRTCMode.ConstantMemory:
+            custom_names = [
+                f"&{kernel.namespace}::{NVRTCConstants.CONSTANT_PARAM_KEY}"
+            ]
+        cudadevrt = ""
+        if SPCONV_NVRTC_MODE == NVRTCMode.DynamicParallism:
+            cudadevrt_p = get_cudadevrt_path()
+            assert cudadevrt_p is not None, "DynamicParallism must have cudadevrt"
+            cudadevrt = str(cudadevrt_p)
+        mod = CummNVRTCModule([kernel],
+                              cudadevrt_path=cudadevrt,
+                              custom_names=custom_names)
+        mod.load()
+        return mod, kernel
+
+    def cached_get_nvrtc_params(self, desp: GemmAlgoDesp, arch: Tuple[int, int], stream_int: int) -> NVRTCParams:
+        
+        key = (str(desp), arch, stream_int)
+        if key in self._nvrtc_caches:
+            return self._nvrtc_caches[key]
+        mod, ker = self._compile_nvrtc_module(desp)
+        nvrtc_params = _get_nvrtc_params(mod, ker, "gemm_kernel")
+        self._nvrtc_caches[key] = nvrtc_params
+        return nvrtc_params
+
+class ConvTunerSimple(ConvTunerSimpleBase):
+    def __init__(self, desps: List[ConvAlgoDesp]) -> None:
+        super().__init__(desps)
+        self._nvrtc_caches: Dict[Tuple[str, Tuple[int, int], int], NVRTCParams] = {}
+    
+    def _compile_nvrtc_module(self, desp: ConvAlgoDesp):
+        params = algocore.get_conv_param_from_desp(desp)
+        kernel = gen_conv_kernels(params, SPCONV_NVRTC_MODE)
+        kernel.namespace = "spconv"
+        custom_names = []
+        if SPCONV_NVRTC_MODE == NVRTCMode.ConstantMemory:
+            custom_names = [
+                f"&{kernel.namespace}::{NVRTCConstants.CONSTANT_PARAM_KEY}"
+            ]
+        cudadevrt = ""
+        if SPCONV_NVRTC_MODE == NVRTCMode.DynamicParallism:
+            cudadevrt_p = get_cudadevrt_path()
+            assert cudadevrt_p is not None, "DynamicParallism must have cudadevrt"
+            cudadevrt = str(cudadevrt_p)
+        mod = CummNVRTCModule([kernel],
+                              cudadevrt_path=cudadevrt,
+                              verbose=False,
+                              custom_names=custom_names)
+        mod.load()
+        return mod, kernel
+
+    def cached_get_nvrtc_params(self, desp: ConvAlgoDesp, arch: Tuple[int, int], stream_int: int) -> NVRTCParams:
+        key = (str(desp), arch, stream_int)
+        if key in self._nvrtc_caches:
+            return self._nvrtc_caches[key]
+        mod, ker = self._compile_nvrtc_module(desp)
+        print(f"Can't find algo {desp} in prebuilt. compile with nvrtc...")
+        nvrtc_params = _get_nvrtc_params(mod, ker, "conv_kernel")
+        self._nvrtc_caches[key] = nvrtc_params
+        return nvrtc_params
 
 class SimpleGemm:
-    def __init__(self, desps: List[GemmAlgoDesp]) -> None:
-        self.desps = desps
+
+    def __init__(self, prebuilt_desps: List[GemmAlgoDesp]) -> None:
+        all_desps = [
+            algocore.get_gemm_algo_desp_from_param(p)
+            for p in ALL_NATIVE_PARAMS
+        ]
+        self.prebuilt_desps = prebuilt_desps
+        self.prebuilt_desp_names = {str(d) for d in prebuilt_desps}
+        if SPCONV_DEBUG_NVRTC_KERNELS:
+            self.prebuilt_desp_names.clear()
         self.lock = Lock()
-        self.static_key_to_desps = group_by(self.get_static_key, desps)
+        self.static_key_to_desps = group_by(self.get_static_key, all_desps)
         self.static_key_to_meta: Dict[_GEMM_STATIC_KEY,
                                       SimpleGemmAlgoMeta] = {}
         for k, static_desps in self.static_key_to_desps.items():
@@ -94,14 +251,45 @@ class SimpleGemm:
 
         self.mn_cache: Dict[Tuple[int, int, int, int, int],
                             BestAlgoByProfile] = {}  # for backward weight
+        self._nvrtc_caches: Dict[Tuple[str, Tuple[int, int]], NVRTCParams] = {}
 
     @staticmethod
     def get_static_key(d: GemmAlgoDesp) -> _GEMM_STATIC_KEY:
         return (d.trans_a, d.trans_b, d.trans_c, d.dtype_a, d.dtype_b,
-                d.dtype_c, d.shuffle_type, d.algo)
+                d.dtype_c, d.shuffle_type.value, d.algo)
 
     def device_synchronize(self):
         return GemmMainUnitTest.device_synchronize()
+
+    def _compile_nvrtc_module(self, desp: GemmAlgoDesp):
+        params = algocore.get_gemm_param_from_desp(desp)
+        kernel = gen_gemm_kernels(params, SPCONV_NVRTC_MODE)
+        kernel.namespace = "spconv"
+        custom_names = []
+        if SPCONV_NVRTC_MODE == NVRTCMode.ConstantMemory:
+            custom_names = [
+                f"&{kernel.namespace}::{NVRTCConstants.CONSTANT_PARAM_KEY}"
+            ]
+        cudadevrt = ""
+        if SPCONV_NVRTC_MODE == NVRTCMode.DynamicParallism:
+            cudadevrt_p = get_cudadevrt_path()
+            assert cudadevrt_p is not None, "DynamicParallism must have cudadevrt"
+            cudadevrt = str(cudadevrt_p)
+        mod = CummNVRTCModule([kernel],
+                              cudadevrt_path=cudadevrt,
+                              custom_names=custom_names)
+        mod.load()
+        return mod, kernel
+
+    def _cached_get_nvrtc_params(self, desp: GemmAlgoDesp, arch: Tuple[int,
+                                                                       int]):
+        key = (str(desp), arch)
+        if key in self._nvrtc_caches:
+            return self._nvrtc_caches[key]
+        mod, ker = self._compile_nvrtc_module(desp)
+        nvrtc_params = _get_nvrtc_params(mod, ker, "gemm_kernel")
+        self._nvrtc_caches[key] = nvrtc_params
+        return nvrtc_params
 
     def get_all_available(
             self,
@@ -121,20 +309,28 @@ class SimpleGemm:
             trans_c = False
         avail_algos = get_available_algo_str_from_arch(arch)
         finally_algos: List[GemmAlgoDesp] = []
+        # print(self.static_key_to_desps)
         for algo in avail_algos:
             static_key = (trans_a, trans_b, trans_c, a.dtype, b.dtype, c.dtype,
                           shuffle_type.value, algo)
+            # print(static_key)
             desps = self.static_key_to_desps.get(static_key, None)
             if desps is None or len(desps) == 0:
                 continue
+            # print(desps)
             for desp in desps:
                 # skip volta tensor op since it is very slow in architectures except volta.
                 if arch >= (7, 5) and desp.algo == GemmAlgo.Volta.value:
                     continue
-                lda = a.dim(1)
-                ldb = b.dim(1)
-                ldc = c.dim(1)
+                lda = a.stride[0]
+                ldb = b.stride[0]
+                ldc = c.stride[0]
                 if desp.supported_ldx(lda, ldb, ldc):
+                    if arch not in COMPILED_CUDA_ARCHS:
+                        desp = desp.copy()
+                        desp.is_nvrtc = True
+                    if SPCONV_DEBUG_NVRTC_KERNELS:
+                        desp.is_nvrtc = True
                     finally_algos.append(desp)
         return finally_algos
 
@@ -320,20 +516,24 @@ class SimpleGemm:
                                                c_inds.shape)
         avail = self.get_all_available(a, b, c, trans_a, trans_b, trans_c,
                                        arch, shuffle_type)
-
-        c_ = c.clone()
+        # c may be weight, may non-contiguous.
+        # cumm.tensorview.Tensor don't support non-contiguous clone
+        c_ = c.clone_whole_storage()
         times: List[float] = []
         best_gather_params = (-1, -1, -1, -1)
         best_scatter_params = (-1, -1, -1, -1)
 
         all_profile_res: List[BestAlgoByProfile] = []
+        # print(avail)
         for desp in avail:
-            c_.zero_()
+            c_.zero_whole_storage_()
             split_k_slices = 1
             # TODO better splitk selection
             if desp.split_k_serial and hint & AlgoHint.BackwardWeight.value:
                 split_k_slices = max(min(32, k // 128), 1)
             params = GemmParams()
+            if desp.is_nvrtc and str(desp) not in self.prebuilt_desp_names:
+                params.nvrtc_params = self._cached_get_nvrtc_params(desp, arch)
             params.a = a
             params.b = b
             params.c = c_
@@ -361,7 +561,8 @@ class SimpleGemm:
                 times.append(np.mean(this_times[1:]))
                 spk_speeds.append(times[-1])
 
-                all_profile_res.append(BestAlgoByProfile(desp, splitk=spk))
+                all_profile_res.append(
+                    BestAlgoByProfile(desp, arch, splitk=spk))
 
         min_time = 1000
         min_idx = -1
@@ -385,27 +586,31 @@ class SimpleGemm:
 
         return res, min_time
 
-    def run_with_tuned_result(
-        self,
-        profile_res: BestAlgoByProfile,
-        a: tv.Tensor,
-        b: tv.Tensor,
-        c: tv.Tensor,
-        trans_a: bool,
-        trans_b: bool,
-        trans_c: bool,
-        arch: Tuple[int, int],
-        stream: int,
-        shuffle_type: ShuffleStrideType = ShuffleStrideType.NoShuffle,
-        a_inds: tv.Tensor = tv.Tensor(),
-        b_inds: tv.Tensor = tv.Tensor(),
-        c_inds: tv.Tensor = tv.Tensor(),
-        hint: int = AlgoHint.NoHint.value,
-        alpha: float = 1.0,
-        beta: float = 0.0,
-        gather_data: tv.Tensor = tv.Tensor(),
-        workspace: tv.Tensor = tv.Tensor(),
-        timer: CUDAKernelTimer = CUDAKernelTimer(False)):
+    def run_with_tuned_result(self,
+                              profile_res: BestAlgoByProfile,
+                              a: tv.Tensor,
+                              b: tv.Tensor,
+                              c: tv.Tensor,
+                              trans_a: bool,
+                              trans_b: bool,
+                              trans_c: bool,
+                              arch: Tuple[int, int],
+                              stream: int,
+                              shuffle_type: ShuffleStrideType,
+                              a_inds: tv.Tensor = tv.Tensor(),
+                              b_inds: tv.Tensor = tv.Tensor(),
+                              c_inds: tv.Tensor = tv.Tensor(),
+                              hint: int = AlgoHint.NoHint.value,
+                              alpha: float = 1.0,
+                              beta: float = 0.0,
+                              gather_data: tv.Tensor = tv.Tensor(),
+                              workspace: tv.Tensor = tv.Tensor(),
+                              timer: CUDAKernelTimer = CUDAKernelTimer(False),
+                              force_nvrtc: bool = False,
+                              bias: Optional[tv.Tensor] = None,
+                              act_alpha: float = 0.0,
+                              act_beta: float = 0.0,
+                              act_type: tv.gemm.Activation = tv.gemm.Activation.None_):
         m, n, k = GemmMainUnitTest.extract_mnk(a.shape, b.shape, trans_a,
                                                trans_b, trans_c,
                                                shuffle_type.value,
@@ -421,9 +626,16 @@ class SimpleGemm:
         if profile_res.splitk > 1:
             split_k_slices = profile_res.splitk
         params = GemmParams()
+        is_not_static = str(algo_desp) not in self.prebuilt_desp_names
+        if algo_desp.is_nvrtc and (is_not_static or force_nvrtc):
+            params.nvrtc_params = self._cached_get_nvrtc_params(
+                algo_desp, profile_res.arch)
+
         params.a = a
         params.b = b
         params.c = c
+        if bias is not None:
+            params.d = bias
         params.a_inds = a_inds
         params.b_inds = b_inds
         params.c_inds = c_inds
@@ -432,6 +644,9 @@ class SimpleGemm:
         params.stream = stream
         params.alpha = alpha
         params.beta = beta
+        params.act_alpha = act_alpha
+        params.act_beta = act_beta
+        params.act_type = act_type
         params.workspace = workspace
         # gather = 0
         # if profile_res.external_gather and not gather_data.empty():
@@ -461,11 +676,18 @@ _CONV_STATIC_KEY = Tuple[int, int, int, int, int, int, int, int, int, str, int]
 
 
 class SimpleConv:
-    def __init__(self, desps: List[ConvAlgoDesp]) -> None:
-        self.desps = desps
+
+    def __init__(self, prebuilt_desps: List[ConvAlgoDesp]) -> None:
+        all_desps = [
+            algocore.get_conv_algo_desp_from_param(p)
+            for p in ALL_IMPGEMM_PARAMS
+        ]
+        self.prebuilt_desps = prebuilt_desps
+        self.prebuilt_desp_names = {str(d) for d in prebuilt_desps}
+        self.prebuilt_desp_names.clear()
         self.lock = Lock()
 
-        self.static_key_to_desps = group_by(self.get_static_key, desps)
+        self.static_key_to_desps = group_by(self.get_static_key, all_desps)
         self.static_key_to_meta: Dict[_CONV_STATIC_KEY,
                                       SimpleGemmAlgoMeta] = {}
         for k, static_desps in self.static_key_to_desps.items():
@@ -501,27 +723,35 @@ class SimpleConv:
                                         int], BestConvAlgoByProfile] = {
                                         }  # for backward weight
 
+        self._nvrtc_caches: Dict[Tuple[str, Tuple[int, int]], NVRTCParams] = {}
+
     @staticmethod
     def get_static_key(d: ConvAlgoDesp) -> _CONV_STATIC_KEY:
-        return (d.layout_i, d.layout_w, d.layout_o, d.interleave_i,
-                d.interleave_w, d.interleave_o, d.dtype_input, d.dtype_weight,
-                d.dtype_output, d.algo, d.op_type)
+        return (d.layout_i.value, d.layout_w.value, d.layout_o.value,
+                d.interleave_i, d.interleave_w, d.interleave_o, d.dtype_input,
+                d.dtype_weight, d.dtype_output, d.algo, d.op_type.value)
 
     def device_synchronize(self):
         return GemmMainUnitTest.device_synchronize()
 
-    def get_all_available(self, inp: tv.Tensor, weight: tv.Tensor,
-                          out: tv.Tensor, layout_i: ConvLayout,
-                          layout_w: ConvLayout, layout_o: ConvLayout,
-                          arch: Tuple[int, int], op_type: ConvOpType,
-                          mask_width: int, fp32_accum: Optional[bool] = None):
+    def get_all_available(self,
+                          inp: tv.Tensor,
+                          weight: tv.Tensor,
+                          out: tv.Tensor,
+                          layout_i: ConvLayout,
+                          layout_w: ConvLayout,
+                          layout_o: ConvLayout,
+                          arch: Tuple[int, int],
+                          op_type: ConvOpType,
+                          mask_width: int,
+                          fp32_accum: Optional[bool] = None):
 
         avail_algos = get_available_algo_str_from_arch(arch)
         finally_algos: List[ConvAlgoDesp] = []
         is_fp16 = inp.dtype == tv.float16 and weight.dtype == tv.float16 and out.dtype == tv.float16
         use_f32_as_accum = False
         kv = int(np.prod(weight.shape[1:-1]))
-        # for 3d conv, if reduce axis is too large, may cause nan during 
+        # for 3d conv, if reduce axis is too large, may cause nan during
         # forward.
         if is_fp16:
             if fp32_accum is None:
@@ -531,6 +761,7 @@ class SimpleConv:
                     use_f32_as_accum = weight.dim(0) * kv > 128 * 27
             else:
                 use_f32_as_accum = fp32_accum
+        # use_f32_as_accum = False
         for algo in avail_algos:
             static_key = (layout_i.layout_type.value,
                           layout_w.layout_type.value,
@@ -545,21 +776,26 @@ class SimpleConv:
                 if arch >= (7, 5) and desp.algo == GemmAlgo.Volta.value:
                     continue
                 if arch >= (7, 0) and is_fp16:
-                    # skip simt fp16 kernels if we have tensor core
                     if desp.algo == GemmAlgo.Simt:
                         continue
                     if use_f32_as_accum:
                         if desp.dacc == tv.float16:
                             continue
-                        
+
                 ldi = inp.dim(-1)
                 ldw = weight.dim(-1)
                 ldo = out.dim(-1)
                 mask_width_valid = True
+
                 if desp.op_type == ConvOpType.kBackwardWeight.value:
                     assert mask_width > 0
                     mask_width_valid = mask_width % desp.tile_shape[2] == 0
                 if desp.supported_ldx_conv(ldi, ldw, ldo) and mask_width_valid:
+                    if arch not in COMPILED_CUDA_ARCHS:
+                        desp = desp.copy()
+                        desp.is_nvrtc = True
+                    if SPCONV_DEBUG_NVRTC_KERNELS:
+                        desp.is_nvrtc = True
                     finally_algos.append(desp)
         return finally_algos
 
@@ -592,6 +828,38 @@ class SimpleConv:
         return desp.query_conv_workspace_size(mnk[0], mnk[1], mnk[2], splitk,
                                               kv)
 
+    def _compile_nvrtc_module(self, desp: ConvAlgoDesp):
+        params = algocore.get_conv_param_from_desp(desp)
+        kernel = gen_conv_kernels(params, SPCONV_NVRTC_MODE)
+        kernel.namespace = "spconv"
+        custom_names = []
+        if SPCONV_NVRTC_MODE == NVRTCMode.ConstantMemory:
+            custom_names = [
+                f"&{kernel.namespace}::{NVRTCConstants.CONSTANT_PARAM_KEY}"
+            ]
+        cudadevrt = ""
+        if SPCONV_NVRTC_MODE == NVRTCMode.DynamicParallism:
+            cudadevrt_p = get_cudadevrt_path()
+            assert cudadevrt_p is not None, "DynamicParallism must have cudadevrt"
+            cudadevrt = str(cudadevrt_p)
+        mod = CummNVRTCModule([kernel],
+                              cudadevrt_path=cudadevrt,
+                              verbose=False,
+                              custom_names=custom_names)
+        mod.load()
+        return mod, kernel
+
+    def _cached_get_nvrtc_params(self, desp: ConvAlgoDesp, arch: Tuple[int,
+                                                                       int]):
+        key = (str(desp), arch)
+        if key in self._nvrtc_caches:
+            return self._nvrtc_caches[key]
+        print(f"Can't find algo {desp} in prebuilt. compile with nvrtc...")
+        mod, ker = self._compile_nvrtc_module(desp)
+        nvrtc_params = _get_nvrtc_params(mod, ker, "conv_kernel")
+        self._nvrtc_caches[key] = nvrtc_params
+        return nvrtc_params
+
     def tune_and_cache(self,
                        op_type: ConvOpType,
                        inp: tv.Tensor,
@@ -613,7 +881,7 @@ class SimpleConv:
                        stream: int = 0,
                        fp32_accum: Optional[bool] = None):
         avail = self.get_all_available(inp, weight, output, layout_i, layout_w,
-                                       layout_o, arch, op_type, mask_width, 
+                                       layout_o, arch, op_type, mask_width,
                                        fp32_accum)
         inp = inp.clone()
         weight = weight.clone()
@@ -626,7 +894,10 @@ class SimpleConv:
         all_profile_res: List[BestConvAlgoByProfile] = []
         for desp in avail:
             # for sparse conv, ndim isn't used, so we just provide a constant value.
-            params = ConvParams(NDIM_DONT_CARE, op_type.value)
+            params = ConvParams(NDIM_DONT_CARE, ConvOpTypeCpp(op_type.value))
+            if desp.is_nvrtc and str(desp) not in self.prebuilt_desp_names:
+                params.nvrtc_params = self._cached_get_nvrtc_params(desp, arch)
+
             params.conv_algo_desp = desp
             params.input = inp
             params.weight = weight.view([channel_k, -1, channel_c])
@@ -640,8 +911,8 @@ class SimpleConv:
             params.indices = indices
             params.mask = mask
             params.mask_output = mask_output
-            if op_type == ConvOpType.kBackwardWeight:
-                assert not mask_output.empty()
+            # if op_type == ConvOpType.kBackwardWeight:
+            #     assert not mask_output.empty()
             if op_type == ConvOpType.kBackwardInput:
                 params.reverse_mask = reverse_mask
             params.mask_filter = mask_filter
@@ -653,17 +924,20 @@ class SimpleConv:
             spk_speeds = []
             for spk in splitk_tests:
                 this_times = []
-                for j in range(3):
-                    GemmMainUnitTest.stream_synchronize(stream)
-                    t = time.time()
+                for j in range(4):
                     params.split_k_slices = spk
-                    ConvMainUnitTest.implicit_gemm2(params)
-                    GemmMainUnitTest.stream_synchronize(stream)
-                    this_times.append(time.time() - t)
+                    with tv.measure_duration(stream=stream) as measure:
+                        if desp.is_nvrtc and str(
+                                desp) not in self.prebuilt_desp_names:
+                            tv.gemm.run_nvrtc_conv_kernel(params)
+                        else:
+                            ConvMainUnitTest.implicit_gemm2(params)
+                    this_times.append(measure.duration)
                 times.append(np.mean(this_times[1:]))
                 spk_speeds.append(times[-1])
 
-                all_profile_res.append(BestConvAlgoByProfile(desp, splitk=spk))
+                all_profile_res.append(
+                    BestConvAlgoByProfile(desp, arch, splitk=spk))
         if not all_profile_res:
             raise ValueError("can't find suitable algorithm for", op_type)
         min_time = 1000
@@ -707,7 +981,12 @@ class SimpleConv:
                               stream: int = 0,
                               workspace: tv.Tensor = tv.Tensor(),
                               verbose: bool = False,
-                              timer: CUDAKernelTimer = CUDAKernelTimer(False)):
+                              timer: CUDAKernelTimer = CUDAKernelTimer(False),
+                              force_nvrtc: bool = False,
+                              bias: Optional[tv.Tensor] = None,
+                              act_alpha: float = 0.0,
+                              act_beta: float = 0.0,
+                              act_type: tv.gemm.Activation = tv.gemm.Activation.None_):
         channel_k = output.dim(1)
         channel_c = inp.dim(1)
         # GemmMainUnitTest.stream_synchronize(stream)
@@ -720,24 +999,36 @@ class SimpleConv:
             op_type_value = op_type
         else:
             op_type_value = op_type.value
-        params = ConvParams(NDIM_DONT_CARE, op_type_value)
+        params = ConvParams(NDIM_DONT_CARE, ConvOpTypeCpp(op_type_value))
+        is_not_static = str(
+                algo_desp) not in self.prebuilt_desp_names
+        if force_nvrtc or (algo_desp.is_nvrtc and is_not_static):
+            params.nvrtc_params = self._cached_get_nvrtc_params(
+                algo_desp, profile_res.arch)
         params.conv_algo_desp = profile_res.algo_desp
         params.input = inp
         params.verbose = verbose
         params.weight = weight.view([channel_k, -1, channel_c])
         params.output = output
+
         params.split_k_slices = split_k_slices
         params.alpha = alpha
         params.beta = beta
+        params.act_alpha = act_alpha
+        params.act_beta = act_beta
+        params.act_type = act_type
         params.stream = stream
         params.mask_argsort = mask_argsort
         params.indices = indices
         params.mask = mask
+
         params.mask_filter = mask_filter
         params.mask_width = mask_width
         params.mask_filter = mask_filter
         params.mask_output = mask_output
         params.reverse_mask = reverse_mask
+        if bias is not None:
+            params.bias = bias
         if timer.enable:
             assert timer._timer is not None
             params.timer = timer._timer
@@ -758,6 +1049,13 @@ class SimpleConv:
 
 GEMM = SimpleGemm(ALL_ALGO_DESPS)
 CONV = SimpleConv(ALL_CONV_ALGO_DESPS)
+
+GEMM_CPP = GemmTunerSimple([
+            algocore.get_gemm_algo_desp_from_param(p)
+            for p in ALL_NATIVE_PARAMS])
+CONV_CPP = ConvTunerSimple([
+            algocore.get_conv_algo_desp_from_param(p)
+            for p in ALL_IMPGEMM_PARAMS])
 
 if __name__ == "__main__":
     print(len(ALL_CONV_ALGO_DESPS))

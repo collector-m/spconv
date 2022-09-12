@@ -1,4 +1,12 @@
 # Changelog
+## [2.1.22] - 2022-6-11
+### Fixed
+- Fix thrust problem by adding -fvisibility=hidden
+
+## [2.1.22] - 2022-4-14
+### Added
+- add full nvrtc support
+- add support for large spatial shape and batch size. if detect large shape, we use int64 instead of int32 when hashing.
 
 ## [2.1.21] - 2021-12-9
 ### Added

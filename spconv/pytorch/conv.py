@@ -24,6 +24,7 @@ from torch.nn import init
 from torch.nn.parameter import Parameter
 
 from spconv import pytorch as spconv
+from spconv import SPCONV_VERSION_NUMBERS
 from spconv.core import ConvAlgo
 from spconv.debug_utils import spconv_save_debug_data
 from spconv.pytorch import functional as Fsp
@@ -31,9 +32,14 @@ from spconv.pytorch import ops
 from spconv.cppconstants import CPU_ONLY_BUILD
 from spconv.pytorch.core import IndiceData, SparseConvTensor, ImplicitGemmIndiceData, expand_nd
 from spconv.pytorch.modules import SparseModule
-from spconv.constants import FILTER_HWIO
+from spconv.constants import SAVED_WEIGHT_LAYOUT, ALL_WEIGHT_IS_KRSC, SPCONV_DEBUG_WEIGHT
 from spconv.utils import nullcontext
 from torch.nn.init import calculate_gain
+from cumm import tensorview as tv
+
+FILTER_HWIO = False
+
+_MAX_NUM_VOXELS_DURING_TRAINING = "max_num_voxels_during_training"
 
 
 class SparseConvolution(SparseModule):
@@ -59,6 +65,10 @@ class SparseConvolution(SparseModule):
                  indice_key: Optional[str] = None,
                  algo: Optional[ConvAlgo] = None,
                  fp32_accum: Optional[bool] = None,
+                 record_voxel_count: bool = False,
+                 act_type: tv.gemm.Activation = tv.gemm.Activation.None_,
+                 act_alpha: float = 0,
+                 act_beta: float = 0,
                  name=None):
         super(SparseConvolution, self).__init__(name=name)
         assert groups == 1, "don't support groups for now"
@@ -66,6 +76,7 @@ class SparseConvolution(SparseModule):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = expand_nd(ndim, kernel_size)
+
         self.stride = expand_nd(ndim, stride)
         kv = int(np.prod(self.kernel_size))
         kv_stride = int(np.prod(self.stride))
@@ -86,6 +97,12 @@ class SparseConvolution(SparseModule):
         self.groups = groups
         self.subm = subm
         self.indice_key = indice_key
+        if record_voxel_count and not self.subm and not self.inverse:
+            # we record maximum voxel num in both inference and training if
+            # record_voxel_count flag setting.
+            self.register_buffer(_MAX_NUM_VOXELS_DURING_TRAINING,
+                                 torch.zeros(1, dtype=torch.int32))
+        self.record_voxel_count = record_voxel_count
         if algo is None:
             if kv <= 32 and not CPU_ONLY_BUILD:
                 if kv < 8:
@@ -101,7 +118,7 @@ class SparseConvolution(SparseModule):
         self.algo = algo
         self.fp32_accum = fp32_accum
         # self.algo = ConvAlgo.Native
-        if self.algo == ConvAlgo.Native:
+        if self.algo == ConvAlgo.Native and not ALL_WEIGHT_IS_KRSC:
             if FILTER_HWIO:
                 # RSCK
                 self.weight = Parameter(
@@ -114,12 +131,62 @@ class SparseConvolution(SparseModule):
             # KRSC
             self.weight = Parameter(
                 torch.Tensor(out_channels, *self.kernel_size, in_channels))
-
         if bias:
             self.bias = Parameter(torch.Tensor(out_channels))
         else:
             self.register_parameter('bias', None)
+
+        self.act_type = act_type
+        self.act_alpha = act_alpha
+        self.act_beta = act_beta
+        if self.conv1x1:
+            assert act_type == tv.gemm.Activation.None_, "conv1x1 don't support fused act"
         self.reset_parameters()
+        if hasattr(self, "_register_load_state_dict_pre_hook"):
+            self._register_load_state_dict_pre_hook(
+                self._load_weight_different_layout)
+
+    def get_max_num_voxels(self) -> Optional[torch.Tensor]:
+        if hasattr(self, _MAX_NUM_VOXELS_DURING_TRAINING):
+            return getattr(self, _MAX_NUM_VOXELS_DURING_TRAINING)
+        return None
+
+    def _load_weight_different_layout(self, state_dict, prefix, local_metadata,
+                                      strict, missing_keys, unexpected_keys,
+                                      error_msgs):
+        if self.record_voxel_count and not self.subm and not self.inverse and _MAX_NUM_VOXELS_DURING_TRAINING not in state_dict:
+            state_dict[prefix + _MAX_NUM_VOXELS_DURING_TRAINING] = torch.zeros(
+                1, dtype=torch.int32)
+        if not SAVED_WEIGHT_LAYOUT:
+            return
+        key = prefix + "weight"
+        assert key in state_dict
+        ndim = self.ndim
+        if SAVED_WEIGHT_LAYOUT == "RSKC":
+            state_dict[key] = state_dict[key].permute(ndim, *range(ndim),
+                                                      ndim + 1).contiguous()
+        elif SAVED_WEIGHT_LAYOUT == "RSCK":
+            state_dict[key] = state_dict[key].permute(ndim + 1, *range(ndim),
+                                                      ndim).contiguous()
+
+        if ALL_WEIGHT_IS_KRSC or self.algo != ConvAlgo.Native:
+            # in spconv 2.2, we only support KRSC layout.
+            if SAVED_WEIGHT_LAYOUT == "RSKC":
+                state_dict[key] = state_dict[key].permute(
+                    ndim, *range(ndim), ndim + 1).contiguous()
+            elif SAVED_WEIGHT_LAYOUT == "RSCK":
+                state_dict[key] = state_dict[key].permute(
+                    ndim + 1, *range(ndim), ndim).contiguous()
+
+        else:
+            if self.algo == ConvAlgo.Native:
+                # to RSCK
+                if SAVED_WEIGHT_LAYOUT == "RSKC":
+                    state_dict[key] = state_dict[key].permute(
+                        *range(ndim), ndim + 1, ndim).contiguous()
+                elif SAVED_WEIGHT_LAYOUT == "KRSC":
+                    state_dict[key] = state_dict[key].permute(
+                        *range(1, ndim + 1), 0, ndim + 1).contiguous()
 
     def extra_repr(self):
         s = ('{in_channels}, {out_channels}, kernel_size={kernel_size}'
@@ -175,11 +242,18 @@ class SparseConvolution(SparseModule):
             return tensor.uniform_(-bound, bound)
 
     def reset_parameters(self):
-        self._custom_kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if SPCONV_DEBUG_WEIGHT:
+            self._custom_kaiming_uniform_(self.weight, a=math.sqrt(0.005))
+        else:
+            self._custom_kaiming_uniform_(self.weight, a=math.sqrt(5))
+
         if self.bias is not None:
             fan_in, _ = self._calculate_fan_in_and_fan_out()
             bound = 1 / math.sqrt(fan_in)
             init.uniform_(self.bias, -bound, bound)
+
+    def is_inverseable(self):
+        return self.indice_key is not None and not self.subm
 
     def forward(self, input: SparseConvTensor):
         assert isinstance(input, SparseConvTensor)
@@ -190,6 +264,12 @@ class SparseConvolution(SparseModule):
         indices = input.indices
         spatial_shape = input.spatial_shape
         batch_size = input.batch_size
+        bias_for_training = self.bias if self.training else None
+        bias_for_infer = self.bias if not self.training else None
+
+        if self.training:
+            msg =  "act don't support backward, only used in inference"
+            assert self.act_type == tv.gemm.Activation.None_, msg
         if not self.subm:
             if self.transposed:
                 out_spatial_shape = ops.get_deconv_output_size(
@@ -328,19 +408,43 @@ class SparseConvolution(SparseModule):
                     indice_pairs_calc = indice_pairs.to(features.device)
                 if self.subm:
                     out_features = Fsp.indice_subm_conv(
-                        features, self.weight, indice_pairs_calc,
-                        indice_pair_num, outids.shape[0], algo, input._timer)
+                        features,
+                        self.weight,
+                        indice_pairs_calc,
+                        indice_pair_num,
+                        outids.shape[0],
+                        algo,
+                        input._timer,
+                        bias_for_infer,
+                        self.act_alpha,
+                        self.act_beta,
+                        self.act_type)
                 else:
                     if self.inverse:
                         out_features = Fsp.indice_inverse_conv(
-                            features, self.weight, indice_pairs_calc,
-                            indice_pair_num, outids.shape[0], algo)
+                            features,
+                            self.weight,
+                            indice_pairs_calc,
+                            indice_pair_num,
+                            outids.shape[0],
+                            algo,
+                            bias_for_infer,
+                            self.act_alpha,
+                            self.act_beta,
+                            self.act_type)
                     else:
-                        out_features = Fsp.indice_conv(features, self.weight,
-                                                       indice_pairs_calc,
-                                                       indice_pair_num,
-                                                       outids.shape[0], algo,
-                                                       input._timer)
+                        out_features = Fsp.indice_conv(
+                            features,
+                            self.weight,
+                            indice_pairs_calc,
+                            indice_pair_num,
+                            outids.shape[0],
+                            algo,
+                            input._timer,
+                            bias_for_infer,
+                            self.act_alpha,
+                            self.act_beta,
+                            self.act_type)
 
             else:
                 datas = input.find_indice_pair(self.indice_key)
@@ -373,7 +477,6 @@ class SparseConvolution(SparseModule):
                         self._check_subm_reuse_valid(input, spatial_shape,
                                                      datas)
                     else:
-
                         with input._timer.namespace("gen_pairs"):
                             # we need to gen bwd indices for regular conv
                             # because it may be inversed.
@@ -443,9 +546,14 @@ class SparseConvolution(SparseModule):
                     pair_mask_fwd_splits, pair_mask_bwd_splits,
                     mask_argsort_fwd_splits, mask_argsort_bwd_splits,
                     num_activate_out, masks, self.training, self.subm,
-                    input._timer, self.fp32_accum)
-        if self.bias is not None:
-            out_features += self.bias
+                    input._timer, self.fp32_accum,
+                    bias_for_infer,
+                    self.act_alpha,
+                    self.act_beta,
+                    self.act_type)
+        
+        if bias_for_training is not None:
+            out_features += bias_for_training
         if input.benchmark:
             torch.cuda.synchronize()
             interval = time.time() - t
@@ -454,6 +562,11 @@ class SparseConvolution(SparseModule):
                 features.shape[0])
             out_tensor.benchmark_record[self.name]["num_out_points"].append(
                 out_features.shape[0])
+        if not self.subm and not self.inverse and self.record_voxel_count:
+            if hasattr(self, _MAX_NUM_VOXELS_DURING_TRAINING):
+                ops.maximum_value_int_(
+                    getattr(self, _MAX_NUM_VOXELS_DURING_TRAINING),
+                    outids.shape[0])
         out_tensor = out_tensor.replace_feature(out_features)
         out_tensor.indices = outids
         out_tensor.indice_dict = indice_dict
@@ -497,20 +610,23 @@ class SparseConv1d(SparseConvolution):
                  indice_key=None,
                  algo: Optional[ConvAlgo] = None,
                  fp32_accum: Optional[bool] = None,
+                 record_voxel_count: bool = False,
                  name=None):
-        super(SparseConv1d, self).__init__(1,
-                                           in_channels,
-                                           out_channels,
-                                           kernel_size,
-                                           stride,
-                                           padding,
-                                           dilation,
-                                           groups,
-                                           bias,
-                                           indice_key=indice_key,
-                                           algo=algo,
-                                           fp32_accum=fp32_accum,
-                                           name=name)
+        super(SparseConv1d,
+              self).__init__(1,
+                             in_channels,
+                             out_channels,
+                             kernel_size,
+                             stride,
+                             padding,
+                             dilation,
+                             groups,
+                             bias,
+                             indice_key=indice_key,
+                             algo=algo,
+                             fp32_accum=fp32_accum,
+                             record_voxel_count=record_voxel_count,
+                             name=name)
 
 
 class SparseConv2d(SparseConvolution):
@@ -526,20 +642,23 @@ class SparseConv2d(SparseConvolution):
                  indice_key=None,
                  algo: Optional[ConvAlgo] = None,
                  fp32_accum: Optional[bool] = None,
+                 record_voxel_count: bool = False,
                  name=None):
-        super(SparseConv2d, self).__init__(2,
-                                           in_channels,
-                                           out_channels,
-                                           kernel_size,
-                                           stride,
-                                           padding,
-                                           dilation,
-                                           groups,
-                                           bias,
-                                           indice_key=indice_key,
-                                           algo=algo,
-                                           fp32_accum=fp32_accum,
-                                           name=name)
+        super(SparseConv2d,
+              self).__init__(2,
+                             in_channels,
+                             out_channels,
+                             kernel_size,
+                             stride,
+                             padding,
+                             dilation,
+                             groups,
+                             bias,
+                             indice_key=indice_key,
+                             algo=algo,
+                             fp32_accum=fp32_accum,
+                             record_voxel_count=record_voxel_count,
+                             name=name)
 
 
 class SparseConv3d(SparseConvolution):
@@ -555,20 +674,23 @@ class SparseConv3d(SparseConvolution):
                  indice_key=None,
                  algo: Optional[ConvAlgo] = None,
                  fp32_accum: Optional[bool] = None,
+                 record_voxel_count: bool = False,
                  name=None):
-        super(SparseConv3d, self).__init__(3,
-                                           in_channels,
-                                           out_channels,
-                                           kernel_size,
-                                           stride,
-                                           padding,
-                                           dilation,
-                                           groups,
-                                           bias,
-                                           indice_key=indice_key,
-                                           algo=algo,
-                                           fp32_accum=fp32_accum,
-                                           name=name)
+        super(SparseConv3d,
+              self).__init__(3,
+                             in_channels,
+                             out_channels,
+                             kernel_size,
+                             stride,
+                             padding,
+                             dilation,
+                             groups,
+                             bias,
+                             indice_key=indice_key,
+                             algo=algo,
+                             fp32_accum=fp32_accum,
+                             record_voxel_count=record_voxel_count,
+                             name=name)
 
 
 class SparseConv4d(SparseConvolution):
@@ -584,20 +706,23 @@ class SparseConv4d(SparseConvolution):
                  indice_key=None,
                  algo: Optional[ConvAlgo] = None,
                  fp32_accum: Optional[bool] = None,
+                 record_voxel_count: bool = False,
                  name=None):
-        super(SparseConv4d, self).__init__(4,
-                                           in_channels,
-                                           out_channels,
-                                           kernel_size,
-                                           stride,
-                                           padding,
-                                           dilation,
-                                           groups,
-                                           bias,
-                                           indice_key=indice_key,
-                                           algo=algo,
-                                           fp32_accum=fp32_accum,
-                                           name=name)
+        super(SparseConv4d,
+              self).__init__(4,
+                             in_channels,
+                             out_channels,
+                             kernel_size,
+                             stride,
+                             padding,
+                             dilation,
+                             groups,
+                             bias,
+                             indice_key=indice_key,
+                             algo=algo,
+                             fp32_accum=fp32_accum,
+                             record_voxel_count=record_voxel_count,
+                             name=name)
 
 
 class SparseConvTranspose1d(SparseConvolution):
@@ -613,21 +738,24 @@ class SparseConvTranspose1d(SparseConvolution):
                  indice_key=None,
                  algo: Optional[ConvAlgo] = None,
                  fp32_accum: Optional[bool] = None,
+                 record_voxel_count: bool = False,
                  name=None):
-        super(SparseConvTranspose1d, self).__init__(1,
-                                                    in_channels,
-                                                    out_channels,
-                                                    kernel_size,
-                                                    stride,
-                                                    padding,
-                                                    dilation,
-                                                    groups,
-                                                    bias,
-                                                    transposed=True,
-                                                    indice_key=indice_key,
-                                                    algo=algo,
-                                                    fp32_accum=fp32_accum,
-                                                    name=name)
+        super(SparseConvTranspose1d,
+              self).__init__(1,
+                             in_channels,
+                             out_channels,
+                             kernel_size,
+                             stride,
+                             padding,
+                             dilation,
+                             groups,
+                             bias,
+                             transposed=True,
+                             indice_key=indice_key,
+                             algo=algo,
+                             fp32_accum=fp32_accum,
+                             record_voxel_count=record_voxel_count,
+                             name=name)
 
 
 class SparseConvTranspose2d(SparseConvolution):
@@ -643,21 +771,24 @@ class SparseConvTranspose2d(SparseConvolution):
                  indice_key=None,
                  algo: Optional[ConvAlgo] = None,
                  fp32_accum: Optional[bool] = None,
+                 record_voxel_count: bool = False,
                  name=None):
-        super(SparseConvTranspose2d, self).__init__(2,
-                                                    in_channels,
-                                                    out_channels,
-                                                    kernel_size,
-                                                    stride,
-                                                    padding,
-                                                    dilation,
-                                                    groups,
-                                                    bias,
-                                                    transposed=True,
-                                                    indice_key=indice_key,
-                                                    algo=algo,
-                                                    fp32_accum=fp32_accum,
-                                                    name=name)
+        super(SparseConvTranspose2d,
+              self).__init__(2,
+                             in_channels,
+                             out_channels,
+                             kernel_size,
+                             stride,
+                             padding,
+                             dilation,
+                             groups,
+                             bias,
+                             transposed=True,
+                             indice_key=indice_key,
+                             algo=algo,
+                             fp32_accum=fp32_accum,
+                             record_voxel_count=record_voxel_count,
+                             name=name)
 
 
 class SparseConvTranspose3d(SparseConvolution):
@@ -673,21 +804,24 @@ class SparseConvTranspose3d(SparseConvolution):
                  indice_key=None,
                  algo: Optional[ConvAlgo] = None,
                  fp32_accum: Optional[bool] = None,
+                 record_voxel_count: bool = False,
                  name=None):
-        super(SparseConvTranspose3d, self).__init__(3,
-                                                    in_channels,
-                                                    out_channels,
-                                                    kernel_size,
-                                                    stride,
-                                                    padding,
-                                                    dilation,
-                                                    groups,
-                                                    bias,
-                                                    transposed=True,
-                                                    indice_key=indice_key,
-                                                    algo=algo,
-                                                    fp32_accum=fp32_accum,
-                                                    name=name)
+        super(SparseConvTranspose3d,
+              self).__init__(3,
+                             in_channels,
+                             out_channels,
+                             kernel_size,
+                             stride,
+                             padding,
+                             dilation,
+                             groups,
+                             bias,
+                             transposed=True,
+                             indice_key=indice_key,
+                             algo=algo,
+                             fp32_accum=fp32_accum,
+                             record_voxel_count=record_voxel_count,
+                             name=name)
 
 
 class SparseConvTranspose4d(SparseConvolution):
@@ -703,21 +837,24 @@ class SparseConvTranspose4d(SparseConvolution):
                  indice_key=None,
                  algo: Optional[ConvAlgo] = None,
                  fp32_accum: Optional[bool] = None,
+                 record_voxel_count: bool = False,
                  name=None):
-        super(SparseConvTranspose4d, self).__init__(4,
-                                                    in_channels,
-                                                    out_channels,
-                                                    kernel_size,
-                                                    stride,
-                                                    padding,
-                                                    dilation,
-                                                    groups,
-                                                    bias,
-                                                    transposed=True,
-                                                    indice_key=indice_key,
-                                                    algo=algo,
-                                                    fp32_accum=fp32_accum,
-                                                    name=name)
+        super(SparseConvTranspose4d,
+              self).__init__(4,
+                             in_channels,
+                             out_channels,
+                             kernel_size,
+                             stride,
+                             padding,
+                             dilation,
+                             groups,
+                             bias,
+                             transposed=True,
+                             indice_key=indice_key,
+                             algo=algo,
+                             fp32_accum=fp32_accum,
+                             record_voxel_count=record_voxel_count,
+                             name=name)
 
 
 class SparseInverseConv1d(SparseConvolution):
